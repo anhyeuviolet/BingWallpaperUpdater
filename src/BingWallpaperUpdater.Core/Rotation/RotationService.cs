@@ -43,6 +43,7 @@ public sealed class RotationService : IDisposable
     // 5 min and the persisted NextDueUtc always means the schedule, never a backoff. Both guarded by _sync.
     private DateTimeOffset? _retryDueUtc;   // in-memory backoff due time; null when no retry is pending
     private int _failureStage;               // 0 after any successful fetch; +1 per failed fetch
+    private int _appliedIntervalMinutes;     // the interval the current NextDueUtc was computed with (ApplySettings, D-07)
     private bool _startupTickDone;
     private volatile bool _disposed;
     private CancellationToken _ct;
@@ -78,6 +79,7 @@ public sealed class RotationService : IDisposable
         _ui = ui;
         _time = time ?? TimeProvider.System;
         _random = random ?? Random.Shared;
+        _appliedIntervalMinutes = settings.IntervalMinutes;
     }
 
     /// <summary>True while a tick holds the gate; the tray reads it to disable "Next wallpaper" (D-05).</summary>
@@ -193,6 +195,37 @@ public sealed class RotationService : IDisposable
 
         TrySaveState();
         Nudge("time-changed");
+    }
+
+    /// <summary>
+    /// Any thread (Phase 3's settings window): the shared <see cref="Settings"/> instance this service was constructed
+    /// with has been mutated and saved by the caller — the service never re-reads <c>settings.json</c> itself (D-09).
+    /// When <see cref="Settings.IntervalMinutes"/> changed, the schedule is recomputed from the last apply rather than
+    /// restarted: <c>NextDueUtc = LastAppliedUtc + newInterval</c>, floored at <c>now + 5 s</c> (D-07,
+    /// <see cref="ScheduleMath.AfterIntervalChange"/>). A mode change needs no bookkeeping because every tick reads
+    /// <see cref="Settings.IsRandomMode"/> live. Persists, logs <c>settings applied ...</c>, then nudges so a shortened
+    /// interval that is already due runs within the debounce instead of up to 60 s later. Safe to call repeatedly.
+    /// </summary>
+    public void ApplySettings()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        DateTimeOffset now = _time.GetUtcNow();
+        lock (_sync)
+        {
+            if (_settings.IntervalMinutes != _appliedIntervalMinutes)
+            {
+                _state.NextDueUtc = ScheduleMath.AfterIntervalChange(_state.LastAppliedUtc, now, _settings.Interval);
+                _appliedIntervalMinutes = _settings.IntervalMinutes;
+            }
+        }
+
+        TrySaveState();
+        Log.Info($"settings applied interval={_settings.IntervalMinutes} mode={_settings.Mode} next={_state.NextDueUtc?.ToString("O") ?? "-"}");
+        Nudge("settings");
     }
 
     /// <summary>

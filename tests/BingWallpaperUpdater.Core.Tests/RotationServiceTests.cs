@@ -792,4 +792,246 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);   // the ladder still arms so the first fetch is retried soon
         Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
     }
+
+    // ---- Plan 02-02 Task 2: clock jumps, DST, ApplySettings, startup jitter, the next-due invariant --------
+
+    [Fact]
+    public async Task BackwardClockJump_3h_ClampsNextDueToNowPlusInterval()
+    {
+        Harness h = Build(Newest(), new AppState());
+        await StartAsync(h);                                 // applies at T0, NextDueUtc = T0 + 30 min
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        h.Applier.Reset();
+
+        _time.AdjustTime(_time.GetUtcNow() - TimeSpan.FromHours(3));   // RESEARCH Pitfall 2: never SetUtcNow backwards
+        h.Service.OnClockChanged();
+
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.Equal(T0 - TimeSpan.FromHours(3), now);
+        Assert.Equal(now + Interval, h.Service.NextDueUtc);   // D-07: never more than one interval ahead
+        Assert.Equal(now + Interval, SavedState()!.NextDueUtc);
+        Assert.Contains("schedule nudge source=time-changed", LogText());
+
+        await AdvanceAsync(h, Interval);                     // exactly one catch-up on the clamped schedule
+
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(0, h.Applier.Calls);                    // unchanged catalog
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task BackwardClockJump_WithoutTimeChangedEvent_HeartbeatClamps()
+    {
+        Harness h = Build(Newest(), new AppState());
+        await StartAsync(h);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+
+        _time.AdjustTime(_time.GetUtcNow() - TimeSpan.FromHours(3));
+        Assert.True(h.Service.NextDueUtc!.Value - _time.GetUtcNow() > Interval);   // 3 h 30 min ahead until a beat runs
+
+        await AdvanceAsync(h, TimeSpan.FromSeconds(60));     // the heartbeat alone must be sufficient (D-07, no TimeChanged bridge)
+
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.True(h.Service.NextDueUtc!.Value - now <= Interval);
+        Assert.Equal(now + Interval, h.Service.NextDueUtc);
+        Assert.Equal(0, LogCount("tick reason=Interval"));
+    }
+
+    [Fact]
+    public async Task ForwardClockJump_3h_OneCatchUpTick()
+    {
+        Harness h = Build(Newest(), new AppState());
+        await StartAsync(h);
+        h.Applier.Reset();
+
+        _time.AdjustTime(_time.GetUtcNow() + TimeSpan.FromHours(3));   // no timer fires on the jump itself
+        Assert.Equal(0, LogCount("tick reason=Interval"));
+
+        await AdvanceAsync(h, TimeSpan.FromSeconds(60));     // the next beat finds the schedule 2 h 30 min overdue
+
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);   // now + interval, not nextDue + n * interval
+        Assert.Equal(0, h.Applier.Calls);
+    }
+
+    [Fact]
+    public async Task Dst_FallBack_ServiceRearmsExactlyTwoHoursUtc()
+    {
+        // CEST -> CET at 2026-10-25T01:00Z: the local day has 25 hours, the interval is still 2 h of UTC.
+        _time.SetLocalTimeZone(TimeZoneInfo.FindSystemTimeZoneById("Central European Standard Time"));
+        var start = new DateTimeOffset(2026, 10, 25, 0, 30, 0, TimeSpan.Zero);
+        _time.SetUtcNow(start);
+        Harness h = Build(new Settings { IntervalMinutes = 120, Mode = Settings.DefaultMode }, new AppState());
+
+        await StartAsync(h);
+
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(new DateTimeOffset(2026, 10, 25, 2, 30, 0, TimeSpan.Zero), h.Service.NextDueUtc);
+        Assert.Equal(TimeSpan.FromHours(2), h.Service.NextDueUtc!.Value - start);
+
+        await AdvanceAsync(h, TimeSpan.FromHours(2));
+
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(_time.GetUtcNow() + TimeSpan.FromHours(2), h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task ApplySettings_IntervalChange_RecomputesFromLastApplied()
+    {
+        Settings settings = Newest();
+        Harness h = Build(settings, new AppState());
+        await StartAsync(h);                                 // applies at T0: LastAppliedUtc == T0 (fake now)
+        Assert.Equal(T0, h.State.LastAppliedUtc);
+        await AdvanceAsync(h, TimeSpan.FromMinutes(10));
+        Assert.Equal(0, LogCount("tick reason=Interval"));
+
+        settings.IntervalMinutes = 60;                       // Phase 3 mutates the shared object, saves settings.json, then calls in
+        h.Service.ApplySettings();
+
+        Assert.Equal(T0 + TimeSpan.FromMinutes(60), h.Service.NextDueUtc);   // LastAppliedUtc + new interval, not now + interval
+        Assert.Equal(T0 + TimeSpan.FromMinutes(60), SavedState()!.NextDueUtc);
+        Assert.Contains($"settings applied interval=60 mode=newest next={(T0 + TimeSpan.FromMinutes(60)):O}", LogText());
+        Assert.Contains("schedule nudge source=settings", LogText());
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(50));     // reaches T0 + 60 min: the recomputed schedule fires once
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(_time.GetUtcNow() + TimeSpan.FromMinutes(60), h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task ApplySettings_IntervalChange_ClampsToNowPlus5s_WhenAlreadyPast()
+    {
+        var settings = new Settings { IntervalMinutes = 120, Mode = Settings.DefaultMode };
+        Harness h = Build(settings, new AppState());
+        await StartAsync(h);                                 // applies at T0
+        h.Applier.Reset();
+        await AdvanceAsync(h, TimeSpan.FromHours(3));        // one interval tick at the 2 h mark, catalog unchanged -> NoOp
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(T0, h.State.LastAppliedUtc);
+
+        settings.IntervalMinutes = 30;                       // T0 + 30 min is long past
+        h.Service.ApplySettings();
+
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.Equal(now + ScheduleMath.MinLeadAfterIntervalChange, h.Service.NextDueUtc);   // never in the past, never immediate
+        Assert.Contains("settings applied interval=30 mode=newest", LogText());
+
+        await AdvanceAsync(h, ScheduleMath.ResumeDebounce + TimeSpan.FromSeconds(5));   // the nudged beat finds it due
+
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Equal(_time.GetUtcNow() + TimeSpan.FromMinutes(30), h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task ApplySettings_SameInterval_DoesNotMoveNextDue()
+    {
+        Settings settings = Newest();
+        Harness h = Build(settings, new AppState());
+        await StartAsync(h);
+        await AdvanceAsync(h, TimeSpan.FromMinutes(10));
+
+        h.Service.ApplySettings();
+
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Contains($"settings applied interval=30 mode=newest next={(T0 + Interval):O}", LogText());
+        Assert.Contains("schedule nudge source=settings", LogText());
+    }
+
+    [Fact]
+    public async Task ApplySettings_ModeChange_NextTickUsesNewMode()
+    {
+        Settings settings = Newest();
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(settings, SeenState(), cache);
+        await StartAsync(h);                                 // not due, catalog unchanged
+        Assert.Equal(0, h.Applier.Calls);
+
+        settings.Mode = Settings.RandomMode;
+        h.Service.ApplySettings();
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);   // a mode change alone never moves the schedule
+        Assert.Contains("settings applied interval=30 mode=random", LogText());
+
+        await AdvanceAsync(h, Interval);                     // the next tick reads the mode live: random rotates
+
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.False(string.Equals(NewestId, h.State.CurrentImageId, StringComparison.Ordinal));
+        Assert.Contains("tick done reason=Interval result=Applied decision=Random why=interval", LogText());
+
+        settings.Mode = Settings.DefaultMode;
+        h.Service.ApplySettings();
+        await AdvanceAsync(h, Interval);                     // back in newest mode the unchanged catalog is a no-op
+
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Contains("tick done reason=Interval result=NoOp decision=NoOp why=unchanged", LogText());
+    }
+
+    [Fact]
+    public async Task Startup_WithJitter_NoTickBeforeDelay_ThenExactlyOne()
+    {
+        Harness h = Build(Newest(), new AppState());
+
+        h.Service.Start(TimeSpan.FromSeconds(45), CancellationToken.None);   // the --startup path (D-12)
+        await AdvanceAsync(h, TimeSpan.FromSeconds(44));
+
+        Assert.Empty(h.Http.Requests);                       // no network activity before the delay elapses
+        Assert.Equal(0, LogCount("tick reason="));
+        Assert.Equal(0, h.Applier.Calls);
+
+        await AdvanceAsync(h, TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, LogCount("tick reason=Startup"));
+        Assert.Equal(1, LogCount("tick reason="));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.NotEmpty(h.Http.Requests);
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task Invariant_NextDueMinusNow_NeverExceedsInterval()
+    {
+        Settings settings = Newest();
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(settings, SeenState(), cache);
+        await StartAsync(h);
+        AssertInvariant(h, settings);
+
+        for (int i = 0; i < 20; i++)
+        {
+            switch (i % 4)
+            {
+                case 0:
+                    await AdvanceAsync(h, TimeSpan.FromMinutes(7));
+                    break;
+                case 1:
+                    settings.IntervalMinutes = settings.IntervalMinutes == 30 ? 60 : 30;
+                    h.Service.ApplySettings();
+                    await h.Service.WaitForIdleAsync();
+                    break;
+                case 2:
+                    _time.AdjustTime(_time.GetUtcNow() - TimeSpan.FromHours(1));   // what the TimeChanged bridge sees
+                    h.Service.OnClockChanged();
+                    await h.Service.WaitForIdleAsync();
+                    break;
+                default:
+                    Assert.Equal(TickResult.Applied, await h.Service.RunTickAsync(TickReason.Next, CancellationToken.None));
+                    break;
+            }
+
+            AssertInvariant(h, settings);
+        }
+
+        Assert.Equal(5, LogCount("decision=StepOlder why=next"));
+        Assert.Equal(5, LogCount("schedule nudge source=time-changed"));
+        Assert.Equal(5, LogCount("settings applied interval="));
+    }
+
+    private void AssertInvariant(Harness h, Settings settings)
+    {
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.NotNull(h.Service.NextDueUtc);
+        TimeSpan lead = h.Service.NextDueUtc!.Value - now;
+        Assert.True(lead <= settings.Interval, $"NextDueUtc - now = {lead} exceeds the interval {settings.Interval} at {now:O}");
+    }
 }
