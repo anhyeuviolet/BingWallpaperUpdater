@@ -1,7 +1,8 @@
 # Non-admin host audit for the walking skeleton (Phase 1, Plan 04; RESEARCH A6, SRC-10).
 #
-# Flushes the DNS client cache, snapshots it, runs publish\BingWallpaperUpdater.exe once (until "apply ok"
-# or "pipeline failed"), stops it, snapshots the cache again, and prints:
+# Flushes the DNS client cache, snapshots it, runs publish\BingWallpaperUpdater.exe once (until the Startup tick
+# logs "tick done" - a Phase 2 restart with nothing new is a NoOp and logs no "apply ok" - or a failure line),
+# stops it, snapshots the cache again, and prints:
 #   (a) "logged hosts:"   every host named by an "http <host> <status> <bytes>" line in the run's log.txt,
 #                         each marked allowed / other  -> the automated gate: exit 1 on any "other"
 #   (b) "dns entries:"    DNS client-cache entries that appeared during the run window, marked the same way.
@@ -86,11 +87,13 @@ while ((Get-Date) -lt $deadline) {
     if ($proc.HasExited) { Fail "process exited early with code $($proc.ExitCode)" }
     $lines = @(Read-Log)
     if ($lines.Count -eq 0) { continue }
-    $outcome = $lines | Where-Object { $_ -match ' INFO apply ok ' -or $_ -match ' pipeline failed ' -or $_ -match ' apply failed ' } | Select-Object -First 1
+    # Phase 2: every launch ends its Startup tick with a "tick done" line whether it applied or not (D-11); the
+    # failure tokens stay as early exits.
+    $outcome = $lines | Where-Object { $_ -match ' INFO tick done reason=Startup ' -or $_ -match ' pipeline failed ' -or $_ -match ' apply failed ' -or $_ -match ' tick failed ' } | Select-Object -First 1
     if ($outcome) { break }
 }
-if (-not $outcome) { Fail "neither 'apply ok' nor 'pipeline failed' within $timeoutSec s" }
-Start-Sleep -Seconds 2   # let the post-apply state/index writes and any trailing DNS activity settle
+if (-not $outcome) { Fail "neither 'tick done reason=Startup' nor a failure line within $timeoutSec s" }
+Start-Sleep -Seconds 2   # let the post-tick state/index writes and any trailing DNS activity settle
 Stop-App
 Write-Host "  outcome: $outcome"
 

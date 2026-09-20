@@ -1,22 +1,37 @@
-# Seven-scenario live smoke run for the walking skeleton (Phase 1, Plan 04).
+# Eleven-scenario live smoke run for the Phase 2 contract (Phase 1 Plan 04 scenarios updated by Phase 2 Plan 04).
 #
 # Drives publish\BingWallpaperUpdater.exe against the real endpoints and reads the fixed log tokens
-# (http, catalog source=, enrich hits=, cache hit, cache add, reconcile dropped=, apply ok). Prints one
-# "PASS S<n> <name>" line per scenario and finally "SMOKE OK" (exit 0), or "SMOKE FAIL S<n>: <reason>"
+# (http, catalog source=, enrich hits=, cache hit, cache add, reconcile dropped=, apply ok, tick done, schedule nudge).
+# Prints one "PASS S<n> <name>" line per scenario and finally "SMOKE OK" (exit 0), or "SMOKE FAIL S<n>: <reason>"
 # plus the last 40 log lines (exit 1) on the first failure.
 #
-#   S0 reset               stop the app, wipe %LocalAppData%\BingWallpaperUpdater, assert the exe exists
-#   S1 first run           catalog source=github, enrich hits=, cache add, UHD download, index metadata, no window
-#   S2 single instance     a second launch leaves exactly one process
-#   S3 idempotent 2nd run  raw.githubusercontent.com 304, cache hit, no cache add, no large Bing download
-#   S4 GitHub blocked      BWU_CATALOG_URL -> 404 path; catalog source=hpimagearchive; apply ok
-#   S5 hand-deleted file   reconcile dropped=1, fresh cache add, apply ok
-#   S6 host set            every "http <host>" line across S1-S5 is on the allow-list
-#   S7 data folder         no *.tmp/*.part, settings.json market, state.json currentImageId == applied[0]
+# Phase 2 contract (CONTEXT D-02, D-03, D-06, D-11): every launch runs one Startup tick that issues one conditional
+# GET; the newest image is applied only when its ID differs from the persisted lastSeenNewestId (or the current
+# file is missing); a restart with nothing new is a NoOp that never re-applies and keeps the persisted nextDueUtc;
+# a past-due schedule catches up exactly once and re-arms to now + interval; a resume signal only nudges the heartbeat.
 #
-# The scripts touch only the app's own data folder and the app's own process. The run leaves today's
-# wallpaper applied and the app stopped (forced stop; a stale tray icon clears on hover). Per-scenario
-# log copies are kept as log.S<n>.txt inside the data folder for the SUMMARY / verifier.
+#   S0  reset                 stop the app, wipe %LocalAppData%\BingWallpaperUpdater, assert the exe exists
+#   S1  first run             catalog source=github, enrich hits=, cache add, UHD download, index metadata, no window,
+#                             tick done result=Applied decision=ApplyNew, state.json scheduler fields
+#   S2  single instance       a second launch leaves exactly one process
+#   S3  NoOp restart          raw.githubusercontent.com 304, cache hit, no cache add, no large Bing download,
+#                             tick done result=NoOp decision=NoOp, no apply ok, nextDueUtc unchanged
+#   S4  GitHub blocked        BWU_CATALOG_URL -> 404 path; catalog source=hpimagearchive; decision=NoOp; no apply ok
+#   S5  hand-deleted file     reconcile dropped=1, fresh cache add, apply ok, decision=ApplyNew why=missing-current
+#   S6  host set              every "http <host>" line across S1-S5 is on the allow-list
+#   S7  data folder           no *.tmp/*.part, settings.json market/interval/mode, state.json scheduler fields,
+#                             state.json currentImageId == applied[0]
+#   S8  past-due catch-up     state.json nextDueUtc 3 h in the past + fake lastSeenNewestId -> one Startup tick,
+#                             result=Applied decision=ApplyNew why=new, apply ok, nextDueUtc re-armed to now + 30 min
+#   S9  not-due restart       state.json nextDueUtc 20 min ahead + lastSeenNewestId == current -> NoOp, schedule kept
+#   S10 synthetic resume      tools/power-probe.ps1 -NoLaunch against the S9 process -> POWER PROBE OK and
+#                             "schedule nudge source=resume-automatic" in the live log
+#
+# The scripts touch only the app's own data folder and the app's own process (T-01-17 / T-02-17: the recursive delete
+# and the state.json edits are limited to the folder ending in \BingWallpaperUpdater; Write-State edits only the
+# named fields and never touches the cache directory). The run leaves today's wallpaper applied and the app stopped
+# (forced stop; a stale tray icon clears on hover). Per-scenario log copies are kept as log.S<n>.txt inside the data
+# folder for the SUMMARY / verifier.
 #
 #   dotnet publish src/BingWallpaperUpdater.App -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o publish
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/smoke-verify.ps1
@@ -26,12 +41,17 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot  = Split-Path -Parent $PSScriptRoot
 $exePath   = Join-Path $repoRoot 'publish\BingWallpaperUpdater.exe'
+$probePath = Join-Path $PSScriptRoot 'power-probe.ps1'
 $data      = Join-Path $env:LOCALAPPDATA 'BingWallpaperUpdater'
 $logPath   = Join-Path $data 'log.txt'
+$statePath = Join-Path $data 'state.json'
+$settingsPath = Join-Path $data 'settings.json'
 $cacheDir  = Join-Path $data 'cache'
 $indexPath = Join-Path $cacheDir 'index.json'
 $procName  = 'BingWallpaperUpdater'
 $allowedHosts = @('raw.githubusercontent.com', 'www.bing.com', 'cn.bing.com')
+$fakeNewestId = 'OHR.SmokeFake_EN-US0000000001'
+$utcFormat = 'yyyy-MM-ddTHH:mm:ssZ'
 
 $script:currentScenario = 'S0'
 
@@ -91,7 +111,7 @@ function Wait-LogLine {
         [Parameter(Mandatory = $true)] [string]$Pattern,
         [System.Diagnostics.Process]$Process = $null,
         [int]$TimeoutSec = 120,
-        [string[]]$FailPatterns = @(' pipeline failed ', ' apply failed ')
+        [string[]]$FailPatterns = @(' pipeline failed ', ' apply failed ', ' tick failed ')
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -107,6 +127,62 @@ function Wait-LogLine {
         if ($hit) { return $hit }
     }
     Fail "no line matching '$Pattern' within $TimeoutSec s"
+}
+
+# Waits for the "tick done reason=<Reason> result=... decision=... why=... next=... retry=..." line that RotationService
+# logs at the end of every tick (after state.json is saved) and returns it.
+function Wait-TickDone([string]$Reason, [System.Diagnostics.Process]$Process = $null, [int]$TimeoutSec = 90) {
+    return Wait-LogLine -Pattern (' INFO tick done reason=' + [regex]::Escape($Reason) + ' ') -Process $Process -TimeoutSec $TimeoutSec
+}
+
+# Extracts "<Name>=<value>" from a tick line (fields are space-separated key=value tokens).
+function Get-TickField([string]$Line, [string]$Name) {
+    if ($Line -notmatch ('(?:^| )' + [regex]::Escape($Name) + '=(?<value>\S+)')) { Fail "tick line lacks '$Name=': $Line" }
+    return $Matches['value']
+}
+
+function Assert-TickField([string]$Line, [string]$Name, [string]$Expected) {
+    $actual = Get-TickField $Line $Name
+    if ($actual -ne $Expected) { Fail "tick line has $Name=$actual, expected $Expected`: $Line" }
+}
+
+function Read-State {
+    return Read-JsonFile $statePath
+}
+
+# Raw string value of a state.json field as written on disk (for byte-identical comparisons); $null when absent/null.
+function Get-StateRawValue([string]$Name) {
+    if (-not (Test-Path $statePath)) { Fail "state.json missing" }
+    $text = [System.IO.File]::ReadAllText($statePath)
+    if ($text -notmatch ('"' + [regex]::Escape($Name) + '"\s*:\s*"(?<value>[^"]*)"')) { return $null }
+    return $Matches['value']
+}
+
+# Rewrites only the named string fields of state.json in place (T-02-17). The edit is textual so every other field
+# stays byte-identical and the file keeps its System.Text.Json shape (no BOM, no PowerShell date re-encoding).
+function Write-State([hashtable]$Fields) {
+    if (-not (Test-Path $statePath)) { Fail "state.json missing - cannot edit it" }
+    if (-not $statePath.EndsWith('\BingWallpaperUpdater\state.json')) { Fail "refusing to edit '$statePath' - not the app state file" }
+    $text = [System.IO.File]::ReadAllText($statePath)
+    foreach ($name in @($Fields.Keys)) {
+        $value = [string]$Fields[$name]
+        if ($value -match '["\\]') { Fail "Write-State value for $name contains a quote or backslash: $value" }
+        $pattern = '"' + [regex]::Escape($name) + '"\s*:\s*(?:"[^"]*"|null)'
+        $replacement = '"' + $name + '": "' + $value + '"'
+        if ($text -match $pattern) {
+            $text = $text -replace $pattern, $replacement
+        } else {
+            $text = $text -replace '^\s*\{', ("{`r`n  " + $replacement + ',')
+        }
+    }
+    [System.IO.File]::WriteAllText($statePath, $text, (New-Object System.Text.UTF8Encoding($false)))
+    try { $null = $text | ConvertFrom-Json } catch { Fail "state.json no longer parses after Write-State: $($_.Exception.Message)" }
+}
+
+function Assert-StateSchedulerFields([string]$What) {
+    foreach ($field in 'nextDueUtc', 'lastCheckUtc', 'lastSeenNewestId') {
+        if ([string]::IsNullOrWhiteSpace((Get-StateRawValue $field))) { Fail "state.json $field is missing or empty ($What)" }
+    }
 }
 
 # "apply ok" is logged only after MarkApplied/state.Save (WR-07), so the index already carries the applied id
@@ -176,6 +252,7 @@ function Assert-NoLeftovers {
 
 $script:currentScenario = 'S0'
 if (-not (Test-Path $exePath)) { Fail "publish\BingWallpaperUpdater.exe is missing - run dotnet publish first" }
+if (-not (Test-Path $probePath)) { Fail "tools\power-probe.ps1 is missing (needed by S10)" }
 # T-01-17: the recursive delete is limited to the app's own folder built from a literal segment.
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -or -not $data.EndsWith('\BingWallpaperUpdater')) { Fail "refusing to delete '$data' - not the app data folder" }
 Stop-App
@@ -190,6 +267,9 @@ $proc = Start-App
 $applyLine = Wait-LogLine -Pattern ' INFO apply ok ' -Process $proc
 $appliedId = Get-AppliedId $applyLine
 Wait-Applied $appliedId
+$tickLine = Wait-TickDone 'Startup' $proc 30
+Assert-TickField $tickLine 'result' 'Applied'
+Assert-TickField $tickLine 'decision' 'ApplyNew'
 $log = @(Read-Log)
 Assert-LogContains $log 'catalog source=github' 'README catalog used' | Out-Null
 Assert-LogContains $log 'enrich hits=' 'HPImageArchive enrichment ran' | Out-Null
@@ -213,13 +293,21 @@ if ($jpgs[0].Name -notmatch '^\d{4}-\d{2}-\d{2}_[A-Za-z0-9]+_[A-Z]{2}-[A-Z]{2}[0
 if ($jpgs[0].Name -ne $img.file) { Fail "cache file '$($jpgs[0].Name)' differs from index file '$($img.file)'" }
 Assert-NoLeftovers
 
+# Phase 2: the Startup tick persists the schedule (ROT-04, ROT-07, D-08).
+Assert-StateSchedulerFields 'after the first Startup tick'
+$state1 = Read-State
+if ($state1.lastSeenNewestId -ne $appliedId) { Fail "state.json lastSeenNewestId is '$($state1.lastSeenNewestId)', expected the applied id $appliedId" }
+$nextDueAfterS1 = Get-StateRawValue 'nextDueUtc'
+
 $running = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)
 if ($running.Count -ne 1) { Fail "expected 1 process after apply, found $($running.Count)" }
 $running[0].Refresh()
 if ($running[0].MainWindowHandle -ne 0) { Fail "MainWindowHandle is $($running[0].MainWindowHandle), expected 0 (no window)" }
 Write-Host "  applied id=$appliedId file=$($img.file) bytes=$($img.bytes) dims=$($img.width)x$($img.height)"
 Write-Host "  title=$($img.title)"
-Write-Host 'PASS S1 first run (github catalog, enrichment, UHD download, no window)'
+Write-Host "  tick: $tickLine"
+Write-Host "  nextDueUtc=$nextDueAfterS1"
+Write-Host 'PASS S1 first run (github catalog, enrichment, UHD download, no window, Applied/ApplyNew, schedule persisted)'
 
 # ---- S2 single instance ---------------------------------------------------------------------------------
 
@@ -234,26 +322,42 @@ Stop-App
 Save-LogCopy 'S1'
 Write-Host 'PASS S2 single instance (second launch exits 0, one process)'
 
-# ---- S3 idempotent second run ---------------------------------------------------------------------------
+# ---- S3 NoOp second run (restart with nothing new) ------------------------------------------------------
 
 $script:currentScenario = 'S3'
 Remove-LogOnly
+$jpgsBefore = @(Get-CacheJpegs)
+if ($jpgsBefore.Count -ne 1) { Fail "expected exactly 1 *.jpg before the second run, found $($jpgsBefore.Count)" }
+$cacheWriteBefore = $jpgsBefore[0].LastWriteTimeUtc
 $proc = Start-App
-$applyLine = Wait-LogLine -Pattern ' INFO apply ok ' -Process $proc
-$appliedId3 = Get-AppliedId $applyLine
-Wait-Applied $appliedId3
+$tickLine = Wait-TickDone 'Startup' $proc
+Assert-TickField $tickLine 'result' 'NoOp'
+Assert-TickField $tickLine 'decision' 'NoOp'
 $log = @(Read-Log)
+Assert-LogLacks $log 'apply ok' 'a restart with nothing new never re-applies (D-11)'
 Assert-LogContains $log 'http raw.githubusercontent.com 304 ' 'conditional GET answered 304' | Out-Null
-Assert-LogContains $log 'cache hit id=' 'cached image reused' | Out-Null
+# A NoOp tick never enters ImageCache.EnsureAsync, so the Phase 1 "cache hit id=" line cannot appear here; the cached
+# image is proven reused by identity instead (same single file, untouched) and the "cache hit" token is asserted in S8,
+# where the Phase 2 re-apply is served from the cache.
 Assert-LogLacks $log 'cache add' 'nothing re-downloaded'
 $large = @(Get-HttpBytes $log @('www.bing.com', 'cn.bing.com') | Where-Object { $_.Bytes -gt 100000 })
 if ($large.Count -gt 0) { Fail "a Bing response above 100000 bytes was fetched on the second run: $($large[0].Line)" }
+$jpgsAfter = @(Get-CacheJpegs)
+if ($jpgsAfter.Count -ne 1) { Fail "expected exactly 1 *.jpg after the second run, found $($jpgsAfter.Count)" }
+if ($jpgsAfter[0].Name -ne $jpgsBefore[0].Name) { Fail "cache file changed across the second run: '$($jpgsBefore[0].Name)' -> '$($jpgsAfter[0].Name)'" }
+if ($jpgsAfter[0].LastWriteTimeUtc -ne $cacheWriteBefore) { Fail "cache file $($jpgsAfter[0].Name) was rewritten on the second run" }
 $index = Read-Index
 if (@($index.images).Count -ne 1) { Fail "index.json images.Count is $(@($index.images).Count) after the second run, expected 1" }
-if ($appliedId3 -ne $appliedId) { Fail "second run applied '$appliedId3', first run applied '$appliedId'" }
+if (@($index.applied)[0] -ne $appliedId) { Fail "index applied[0] is '$(@($index.applied)[0])' after the second run, first run applied '$appliedId'" }
+$nextDueAfterS3 = Get-StateRawValue 'nextDueUtc'
+if ($nextDueAfterS3 -ne $nextDueAfterS1) { Fail "state.json nextDueUtc changed across the restart: '$nextDueAfterS1' -> '$nextDueAfterS3'" }
+$state3 = Read-State
+if ($state3.currentImageId -ne $appliedId) { Fail "state.json currentImageId is '$($state3.currentImageId)' after the second run, expected $appliedId" }
 Stop-App
 Save-LogCopy 'S3'
-Write-Host 'PASS S3 idempotent second run (304, cache hit, no download)'
+Write-Host "  tick: $tickLine"
+Write-Host "  nextDueUtc unchanged: $nextDueAfterS3"
+Write-Host 'PASS S3 NoOp second run (304, cache hit, no download, no re-apply, nextDueUtc kept)'
 
 # ---- S4 GitHub blocked -> HPImageArchive ----------------------------------------------------------------
 
@@ -262,17 +366,17 @@ Remove-LogOnly
 $random = [guid]::NewGuid().ToString('N').Substring(0, 12)
 $blockedUrl = "https://raw.githubusercontent.com/niumoo/bing-wallpaper/main/does-not-exist-$random.md"
 $proc = Start-App -CatalogUrl $blockedUrl
-$applyLine = Wait-LogLine -Pattern ' INFO apply ok ' -Process $proc
-$appliedId4 = Get-AppliedId $applyLine
-Wait-Applied $appliedId4
+$tickLine = Wait-TickDone 'Startup' $proc
 $log = @(Read-Log)
 Assert-LogContains $log 'http raw.githubusercontent.com 404 ' 'override URL answered 404' | Out-Null
 Assert-LogContains $log 'catalog github failed' 'GitHub source reported as failed' | Out-Null
 Assert-LogContains $log 'catalog source=hpimagearchive' 'HPImageArchive became the catalog' | Out-Null
-Assert-LogContains $log 'apply ok' 'wallpaper still applied' | Out-Null
+Assert-TickField $tickLine 'decision' 'NoOp'
+Assert-LogLacks $log 'apply ok' 'HPImageArchive newest equals lastSeenNewestId, so the desktop is untouched'
 Stop-App
 Save-LogCopy 'S4'
-Write-Host 'PASS S4 github blocked -> hpimagearchive fallback, apply ok'
+Write-Host "  tick: $tickLine"
+Write-Host 'PASS S4 github blocked -> hpimagearchive fallback, no re-apply'
 
 # ---- S5 hand-deleted file reconcile ---------------------------------------------------------------------
 
@@ -285,6 +389,9 @@ $proc = Start-App
 $applyLine = Wait-LogLine -Pattern ' INFO apply ok ' -Process $proc
 $appliedId5 = Get-AppliedId $applyLine
 Wait-Applied $appliedId5
+$tickLine = Wait-TickDone 'Startup' $proc 30
+Assert-TickField $tickLine 'decision' 'ApplyNew'
+Assert-TickField $tickLine 'why' 'missing-current'
 $log = @(Read-Log)
 $reconcileLine = Assert-LogContains $log 'reconcile dropped=1' 'missing file dropped from the index'
 $addLine = Assert-LogContains $log 'cache add id=' 'image re-downloaded'
@@ -298,7 +405,8 @@ $file5 = Join-Path $cacheDir (@($index.images)[0].file)
 if (-not (Test-Path $file5)) { Fail "index.json points at a missing file: $file5" }
 Stop-App
 Save-LogCopy 'S5'
-Write-Host 'PASS S5 hand-deleted file -> reconcile dropped=1, fresh cache add, apply ok'
+Write-Host "  tick: $tickLine"
+Write-Host 'PASS S5 hand-deleted file -> reconcile dropped=1, fresh cache add, apply ok (ApplyNew why=missing-current)'
 
 # ---- S6 host set ----------------------------------------------------------------------------------------
 
@@ -327,13 +435,105 @@ Write-Host 'PASS S6 host set (only raw.githubusercontent.com / www.bing.com / cn
 
 $script:currentScenario = 'S7'
 Assert-NoLeftovers
-$settingsRaw = Get-Content (Join-Path $data 'settings.json') -Raw
+$settingsRaw = Get-Content $settingsPath -Raw
 if ($settingsRaw -notmatch '"market":\s*"en-US"') { Fail 'settings.json lacks "market": "en-US"' }
-$state = Read-JsonFile (Join-Path $data 'state.json')
+if ($settingsRaw -notmatch '"intervalMinutes":\s*30') { Fail 'settings.json lacks "intervalMinutes": 30' }
+if ($settingsRaw -notmatch '"mode":\s*"newest"') { Fail 'settings.json lacks "mode": "newest"' }
+Assert-StateSchedulerFields 'S7 data folder'
+$state = Read-State
 $index = Read-Index
 if (@($index.applied).Count -lt 1) { Fail 'index.json applied is empty' }
 if ($state.currentImageId -ne @($index.applied)[0]) { Fail "state.json currentImageId '$($state.currentImageId)' differs from index applied[0] '$(@($index.applied)[0])'" }
-Write-Host 'PASS S7 data folder (no tmp/part, settings market, state == applied)'
+Write-Host 'PASS S7 data folder (no tmp/part, settings interval/mode, state scheduler fields, state == applied)'
+
+# ---- S8 past-due catch-up -------------------------------------------------------------------------------
+
+$script:currentScenario = 'S8'
+Stop-App
+Remove-LogOnly
+$pastDue = (Get-Date).ToUniversalTime().AddHours(-3).ToString($utcFormat)
+Write-State @{ nextDueUtc = $pastDue; lastSeenNewestId = $fakeNewestId }
+if ((Get-StateRawValue 'nextDueUtc') -ne $pastDue) { Fail "Write-State did not set nextDueUtc to $pastDue" }
+if ((Get-StateRawValue 'lastSeenNewestId') -ne $fakeNewestId) { Fail "Write-State did not set lastSeenNewestId to $fakeNewestId" }
+$before = Get-Date
+$proc = Start-App
+$tickLine = Wait-TickDone 'Startup' $proc
+Assert-TickField $tickLine 'result' 'Applied'
+Assert-TickField $tickLine 'decision' 'ApplyNew'
+Assert-TickField $tickLine 'why' 'new'
+$log = @(Read-Log)
+$applyLine = Assert-LogContains $log 'apply ok' 'past-due schedule with a new catalog id applied once'
+$appliedId8 = Get-AppliedId $applyLine
+Wait-Applied $appliedId8
+Assert-LogContains $log 'cache hit id=' 'the catch-up apply was served from the cache' | Out-Null
+Assert-LogLacks $log 'cache add' 'nothing re-downloaded for the catch-up'
+$applyLines = @($log | Where-Object { $_.Contains(' apply ok ') })
+if ($applyLines.Count -ne 1) { Fail "expected exactly one apply ok in the catch-up run, found $($applyLines.Count)" }
+$tickLines = @($log | Where-Object { $_ -match ' INFO tick reason=' })
+if ($tickLines.Count -ne 1) { Fail "expected exactly one tick in the catch-up run, found $($tickLines.Count)" }
+$nextDueRaw8 = Get-StateRawValue 'nextDueUtc'
+if ([string]::IsNullOrWhiteSpace($nextDueRaw8)) { Fail 'state.json nextDueUtc missing after the catch-up tick' }
+$nextDue8 = [DateTimeOffset]::Parse($nextDueRaw8, [cultureinfo]::InvariantCulture)
+$lower = [DateTimeOffset]$before.AddMinutes(29)
+$upper = [DateTimeOffset](Get-Date).AddMinutes(31)
+if ($nextDue8 -lt $lower -or $nextDue8 -gt $upper) { Fail "nextDueUtc $($nextDue8.ToString('o')) is not within 29-31 min of now ($($lower.ToString('o')) .. $($upper.ToString('o')))" }
+$state8 = Read-State
+if ($state8.lastSeenNewestId -ne $appliedId8) { Fail "state.json lastSeenNewestId is '$($state8.lastSeenNewestId)', expected the applied id $appliedId8" }
+if ($state8.currentImageId -ne $appliedId8) { Fail "state.json currentImageId is '$($state8.currentImageId)', expected $appliedId8" }
+Stop-App
+Save-LogCopy 'S8'
+Write-Host "  tick: $tickLine"
+Write-Host "  nextDueUtc before=$pastDue after=$nextDueRaw8"
+Write-Host 'PASS S8 past-due state -> one catch-up tick, apply ok, nextDueUtc re-armed'
+
+# ---- S9 not-due restart, unchanged catalog --------------------------------------------------------------
+
+$script:currentScenario = 'S9'
+Remove-LogOnly
+$futureDue = (Get-Date).ToUniversalTime().AddMinutes(20).ToString($utcFormat)
+$currentId = (Read-State).currentImageId
+if ([string]::IsNullOrWhiteSpace([string]$currentId)) { Fail 'state.json currentImageId is empty before S9' }
+Write-State @{ nextDueUtc = $futureDue; lastSeenNewestId = $currentId }
+$proc = Start-App   # left running for S10
+$tickLine = Wait-TickDone 'Startup' $proc
+Assert-TickField $tickLine 'result' 'NoOp'
+Assert-TickField $tickLine 'decision' 'NoOp'
+$log = @(Read-Log)
+Assert-LogLacks $log 'apply ok' 'future schedule with an unchanged catalog never re-applies'
+$nextDueRaw9 = Get-StateRawValue 'nextDueUtc'
+if ([string]::IsNullOrWhiteSpace($nextDueRaw9)) { Fail 'state.json nextDueUtc missing after the not-due tick' }
+$written9 = [DateTimeOffset]::Parse($futureDue, [cultureinfo]::InvariantCulture)
+$nextDue9 = [DateTimeOffset]::Parse($nextDueRaw9, [cultureinfo]::InvariantCulture)
+$driftSec = [math]::Abs(($nextDue9 - $written9).TotalSeconds)
+if ($driftSec -gt 1) { Fail "nextDueUtc moved across the restart: wrote $futureDue, read $nextDueRaw9 (drift $driftSec s)" }
+$state9 = Read-State
+if ($state9.lastSeenNewestId -ne $currentId) { Fail "state.json lastSeenNewestId is '$($state9.lastSeenNewestId)', expected $currentId" }
+if ($proc.HasExited) { Fail "process exited before S10 with code $($proc.ExitCode)" }
+Save-LogCopy 'S9'
+Write-Host "  tick: $tickLine"
+Write-Host "  nextDueUtc written=$futureDue read=$nextDueRaw9"
+Write-Host 'PASS S9 future nextDueUtc + unchanged catalog -> NoOp, schedule kept'
+
+# ---- S10 synthetic resume (WM_POWERBROADCAST / PBT_APMRESUMEAUTOMATIC) ------------------------------------
+
+$script:currentScenario = 'S10'
+# The probe reports through stdout only (Write-Host); stderr is left alone so a stray native error cannot become a
+# terminating NativeCommandError under $ErrorActionPreference = 'Stop' in PowerShell 5.1.
+$probeOutput = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $probePath -NoLaunch | ForEach-Object { [string]$_ })
+$probeExit = $LASTEXITCODE
+$probeOutput | ForEach-Object { Write-Host "  probe: $_" }
+if ($probeExit -ne 0) { Fail "power-probe.ps1 -NoLaunch exited with code $probeExit" }
+$probeOk = @($probeOutput | Where-Object { $_ -match '^POWER PROBE OK ' })
+if ($probeOk.Count -lt 1) { Fail 'power-probe.ps1 output lacks "POWER PROBE OK"' }
+$log = @(Read-Log)
+$nudgeLine = Assert-LogContains $log 'schedule nudge source=resume-automatic' 'synthetic resume nudged the heartbeat'
+Assert-LogContains $log 'power window hwnd=0x' 'hidden power window registered' | Out-Null
+Assert-LogLacks $log 'apply ok' 'a resume signal only nudges, it never applies'
+if ($proc.HasExited) { Fail "process exited during S10 with code $($proc.ExitCode)" }
+Stop-App
+Save-LogCopy 'S10'
+Write-Host "  nudge: $nudgeLine"
+Write-Host 'PASS S10 synthetic WM_POWERBROADCAST resume -> schedule nudge logged'
 
 Write-Host 'SMOKE OK'
 exit 0
