@@ -616,6 +616,47 @@ public sealed class HttpGatewayTests : IDisposable
         Assert.Null(Assert.Single(fake.Requests).Header("If-None-Match"));
     }
 
+    // ---- text body cap (WR-03) --------------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetText_ContentLengthAboveTextCap_ThrowsHttpRequestException_NoRetryNoFailover()
+    {
+        Stream body = FakeHttpHandler.StreamThatMustNotBeRead();
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Stream(200, "application/json", body, HttpGateway.MaxTextBytes + 1));
+        var delays = new List<TimeSpan>();
+        Uri archive = new($"https://{Www}/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=en-US");
+
+        HttpRequestException ex = await Assert.ThrowsAsync<HttpRequestException>(() => Gateway(fake, RecordingPolicy(delays)).GetTextAsync(archive, null, CancellationToken.None));
+
+        Assert.Equal(HttpRequestError.ConfigurationLimitExceeded, ex.HttpRequestError);
+        Assert.Single(fake.Requests);
+        Assert.Empty(fake.RequestsTo(Cn));
+        Assert.Empty(delays);
+    }
+
+    [Fact]
+    public async Task GetText_ChunkedBodyAboveTextCap_AbandonedAtTheCap_SingleRequest()
+    {
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Stream(200, "text/plain", FakeHttpHandler.EndlessStream(HttpGateway.MaxTextBytes + 1), contentLength: null));
+
+        HttpRequestException ex = await Assert.ThrowsAsync<HttpRequestException>(() => Gateway(fake).GetTextAsync(ReadmeUrl, null, CancellationToken.None));
+
+        Assert.Equal(HttpRequestError.ConfigurationLimitExceeded, ex.HttpRequestError);
+        Assert.Single(fake.Requests);
+    }
+
+    [Fact]
+    public async Task GetText_BodyJustUnderTextCap_IsReturned()
+    {
+        var body = new string('x', 64 * 1024);
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Text(200, body));
+
+        TextResponse response = await Gateway(fake).GetTextAsync(ReadmeUrl, null, CancellationToken.None);
+
+        Assert.Equal(200, response.Status);
+        Assert.Equal(body, response.Body);
+    }
+
     // ---- hygiene (SRC-10, T-01-05) -----------------------------------------------------------------------
 
     [Fact]

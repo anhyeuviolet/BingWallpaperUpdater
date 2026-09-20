@@ -154,6 +154,23 @@ public sealed class CatalogServiceTests : IDisposable
 
     // ---- fallback -------------------------------------------------------------------------------
 
+    /// <summary>WR-03: an oversized README is refused by the gateway's text cap and the catalog falls back to HPImageArchive.</summary>
+    [Fact]
+    public async Task GetCatalog_ReadmeBodyAboveTextCap_FallsBackToArchiveAfterASingleRequest()
+    {
+        var huge = new byte[HttpGateway.MaxTextBytes + 1];
+        Array.Fill(huge, (byte)'#');
+        FakeHttpHandler fake = Fake(_ => FakeHttpHandler.Bytes(200, "text/plain", huge), _ => FakeHttpHandler.Json(200, Archive()));
+
+        IReadOnlyList<CatalogEntry> rows = await Service(fake).GetCatalogAsync("en-US", CancellationToken.None);
+
+        Assert.Equal(8, rows.Count);
+        Assert.All(rows, r => Assert.Equal(CatalogSources.HpImageArchive, r.Source));
+        Assert.Single(fake.RequestsTo(GitHubHost));
+        Assert.Contains("catalog github failed reason=HttpRequestException", LogText());
+        Assert.False(File.Exists(_catalogPath), "an oversized body must never reach catalog.md");
+    }
+
     [Fact]
     public async Task GetCatalog_ReadmeThrows_FallsBackToArchive()
     {

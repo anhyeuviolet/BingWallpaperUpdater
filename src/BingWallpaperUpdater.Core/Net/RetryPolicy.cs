@@ -143,8 +143,14 @@ public sealed class RetryPolicy
         return TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * factor);
     }
 
-    /// <summary>Transport-level failures worth another attempt; the caller's cancellation is not one.</summary>
-    private static bool IsTransient(Exception ex, CancellationToken ct) =>
+    /// <summary>
+    /// Transport-level failures worth another attempt; the caller's cancellation is not one, and neither is a
+    /// response that exceeded a configured limit (<see cref="HttpRequestError.ConfigurationLimitExceeded"/> — the
+    /// text buffer cap): the same oversized body would come back on every retry and on the mirror.
+    /// </summary>
+    internal static bool IsTransient(Exception ex, CancellationToken ct) =>
         !ct.IsCancellationRequested
-        && ex is HttpRequestException or IOException or TaskCanceledException;
+        && ex is HttpRequestException { HttpRequestError: not HttpRequestError.ConfigurationLimitExceeded }
+            or IOException
+            or TaskCanceledException;
 }

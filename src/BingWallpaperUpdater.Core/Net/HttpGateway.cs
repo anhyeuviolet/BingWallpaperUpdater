@@ -28,6 +28,14 @@ public sealed class HttpGateway : IDisposable
     /// <summary>Largest body ever accepted; a UHD Bing JPEG is 0.6-3.6 MB, so this is a DoS guard, not a limit.</summary>
     public const long MaxBodyBytes = 64 * 1024 * 1024;
 
+    /// <summary>
+    /// Largest text body <see cref="GetTextAsync"/> will buffer (README and HPImageArchive JSON are tens of KB).
+    /// Enforced by <see cref="HttpClient.MaxResponseContentBufferSize"/>: a larger <c>Content-Length</c> is refused
+    /// before the body is read and a longer chunked body is abandoned at the cap, both as a non-transient
+    /// <see cref="HttpRequestException"/> (WR-03).
+    /// </summary>
+    public const long MaxTextBytes = 4 * 1024 * 1024;
+
     private const int CopyBufferSize = 1 << 16;
     private readonly HttpClient _client;
     private readonly RetryPolicy _retry;
@@ -61,6 +69,7 @@ public sealed class HttpGateway : IDisposable
         _client = new HttpClient(handler, disposeHandler: true)
         {
             Timeout = TimeSpan.FromSeconds(30),
+            MaxResponseContentBufferSize = MaxTextBytes, // only buffered (ResponseContentRead) bodies; images stream under MaxBodyBytes
         };
         _client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent ?? DefaultUserAgent());
         _retry = retry ?? new RetryPolicy();
@@ -247,7 +256,7 @@ public sealed class HttpGateway : IDisposable
         {
             response = await SendWithRetryAsync(url, ifNoneMatch, completion, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (canFailOver && !ct.IsCancellationRequested && ex is HttpRequestException or IOException or TaskCanceledException)
+        catch (Exception ex) when (canFailOver && RetryPolicy.IsTransient(ex, ct))
         {
             Log.Warn($"failover host={BingImageUrl.RetryHost} reason={ex.GetType().Name}: {ex.Message}");
             return await SendWithRetryAsync(FailoverUrl(url), ifNoneMatch, completion, ct).ConfigureAwait(false);
