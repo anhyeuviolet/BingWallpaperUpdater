@@ -14,8 +14,9 @@ namespace BingWallpaperUpdater.Windows.Wallpaper;
 /// back with <c>GetWallpaper(NULL)</c>/<c>GetPosition</c> and a mismatch is logged, never thrown (PITFALLS P4).
 /// Call on the WinForms UI thread; the COM proxy is created per apply and simply dropped afterwards
 /// (source-generated <c>ComObject</c> RCWs must not go through the Marshal release helpers).
-/// When activation itself throws, the call degrades to <see cref="SpiWallpaperFallback"/>; a failure
-/// after a successful activation (bad path, shell error) is reported as-is without falling back.
+/// When activation itself throws (any type <see cref="ComFailure.IsActivationFailure"/> admits), the call degrades
+/// to <see cref="SpiWallpaperFallback"/>; a failure after a successful activation (bad path, shell error — any type
+/// <see cref="ComFailure.IsCallFailure"/> admits) is reported as an <see cref="ApplyResult"/> without falling back.
 /// Phase 1 deliberately has no per-monitor enumeration.
 /// </summary>
 [SupportedOSPlatform("windows8.0")]
@@ -35,10 +36,12 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
         {
             wallpaper = DesktopWallpaper.CreateInstance<IDesktopWallpaper>();
         }
-        catch (COMException ex)
+        catch (Exception ex) when (ComFailure.IsActivationFailure(ex))
         {
             // Activation failure only (no IDesktopWallpaper on this session): degrade to the legacy SPI path.
-            Log.Warn($"apply failed method={MethodName} error=activation failed 0x{ex.HResult:X8} {ex.Message}");
+            // CreateInstance goes through Marshal.ThrowExceptionForHR, which maps HRESULTs to several types
+            // (COMException, InvalidCastException, NotImplementedException, UnauthorizedAccessException, ...).
+            Log.Warn($"apply failed method={MethodName} error=activation failed {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
             return SpiWallpaperFallback.Apply(absolutePath);
         }
 
@@ -61,9 +64,11 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
 
             return new ApplyResult(true, MethodName, readBack, position.ToString(), null);
         }
-        catch (COMException ex)
+        catch (Exception ex) when (ComFailure.IsCallFailure(ex))
         {
-            return new ApplyResult(false, MethodName, null, null, $"0x{ex.HResult:X8} {ex.Message}");
+            // SetPosition / SetWallpaper / GetWallpaper failed after a good activation: E_INVALIDARG surfaces as
+            // ArgumentException and E_ACCESSDENIED as UnauthorizedAccessException, not only as COMException.
+            return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
         }
     }
 
