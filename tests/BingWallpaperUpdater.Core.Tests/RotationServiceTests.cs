@@ -99,6 +99,49 @@ public sealed class RotationServiceTests : IDisposable
         return fake;
     }
 
+    /// <summary>Every host unreachable: the single responder throws <see cref="HttpRequestException"/> for every request (both catalog sources and both image hosts).</summary>
+    private static FakeHttpHandler Offline() => new(FakeHttpHandler.Throw(new HttpRequestException("simulated offline")));
+
+    /// <summary>Mutable network state for <see cref="Switchable"/>: flip <see cref="Online"/> mid-test to simulate the network returning.</summary>
+    private sealed class Network
+    {
+        public bool Online { get; set; }
+    }
+
+    /// <summary>Offline while <c>network.Online</c> is false (throws like <see cref="Offline"/>); the same routes as <see cref="Routes"/> once it is true.</summary>
+    private static FakeHttpHandler Switchable(Network network)
+    {
+        string body = Fixture("README.sample.md");
+        string archive = Fixture("hpimagearchive.sample.json");
+        return new FakeHttpHandler(req =>
+        {
+            if (!network.Online)
+            {
+                throw new HttpRequestException("simulated offline");
+            }
+
+            Uri uri = req.RequestUri!;
+            if (string.Equals(uri.Host, GitHubHost, StringComparison.OrdinalIgnoreCase))
+            {
+                return req.Headers.IfNoneMatch.Count > 0
+                    ? FakeHttpHandler.Text(304, string.Empty, Etag)
+                    : FakeHttpHandler.Text(200, body, Etag);
+            }
+
+            if (uri.AbsolutePath.StartsWith(ArchivePath, StringComparison.Ordinal))
+            {
+                return FakeHttpHandler.Json(200, archive);
+            }
+
+            if (uri.AbsolutePath.StartsWith(ImagePath, StringComparison.Ordinal))
+            {
+                return FakeHttpHandler.Bytes(200, "image/jpeg", JpegBytes.Sof0(3840, 2160));
+            }
+
+            throw new UnroutedRequestException($"no fake route for {req.Method} {uri}");
+        });
+    }
+
     private static CachedImage Cached(string id, string date, int downloadedMinutesAfterT0 = 0, string resolution = "UHD", int width = 3840) => new()
     {
         Id = id,
@@ -160,7 +203,15 @@ public sealed class RotationServiceTests : IDisposable
 
     private static Settings RandomMode() => new() { IntervalMinutes = 30, Mode = Settings.RandomMode };
 
+    private static Settings WithMode(string mode) => new() { IntervalMinutes = 30, Mode = mode };
+
     private AppState? SavedState() => AtomicJsonFile.Load(_statePath, CoreJsonContext.Default.AppState);
+
+    private string SavedStateText() => File.Exists(_statePath) ? File.ReadAllText(_statePath) : string.Empty;
+
+    /// <summary>The retry ladder is in memory only (D-13): the persisted file must never mention it.</summary>
+    private void AssertStateFileHasNoRetry() =>
+        Assert.DoesNotContain("retry", SavedStateText(), StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Start the heartbeat with no initial delay and wait for the startup tick to finish. A zero due time fires inside
@@ -486,5 +537,259 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(0, h.Applier.Calls);
         Assert.Equal(0, LogCount("tick reason=Interval"));
         Assert.Equal(TickResult.Cancelled, await h.Service.RunTickAsync(TickReason.Next, CancellationToken.None));
+    }
+
+    // ---- Plan 02-02 Task 1: retry ladder and the offline matrix (D-13, D-14, ROT-06, CACHE-04) --------
+
+    /// <summary>Current image applied and present, catalog already seen, schedule persisted for <paramref name="dueInMinutes"/> from T0.</summary>
+    private static AppState SeenState(string current = NewestId, int? dueInMinutes = 30) => new()
+    {
+        CurrentImageId = current,
+        LastSeenNewestId = current,
+        NextDueUtc = dueInMinutes is { } m ? T0.AddMinutes(m) : null,
+    };
+
+    [Fact]
+    public async Task Backoff_5_15_ThenInterval()
+    {
+        // Newest mode, one cached image already on the desktop, nothing persisted yet: the startup tick is due and
+        // re-arms the schedule to T0 + 30 min, but its fetch fails on every host.
+        ImageCache cache = SeedCache([Cached(NewestId, "2026-09-20")], applied: NewestId);
+        Harness h = Build(Newest(), SeenState(dueInMinutes: null), cache, Offline());
+
+        await StartAsync(h);
+
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(1, h.Service.FailureStage);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Contains("tick done reason=Startup result=FetchFailed decision=NoOp why=unchanged", LogText());
+        Assert.Contains($"retry scheduled stage=1 at={(T0 + TimeSpan.FromMinutes(5)):O}", LogText());
+        Assert.Contains($"retry={(T0 + TimeSpan.FromMinutes(5)):O}", LogText());
+        AssertStateFileHasNoRetry();
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));   // first retry, about 5 min after the failure
+
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(2, h.Service.FailureStage);
+        Assert.Equal(now + TimeSpan.FromMinutes(15), h.Service.RetryDueUtc);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);   // a Retry tick never touches the schedule
+        Assert.Contains($"retry scheduled stage=2 at={(now + TimeSpan.FromMinutes(15)):O}", LogText());
+        AssertStateFileHasNoRetry();
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(15));  // second retry, about 15 min later
+
+        Assert.Equal(2, LogCount("tick reason=Retry"));
+        Assert.Equal(3, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+        Assert.Contains($"retry exhausted stage=3 next={(T0 + Interval):O}", LogText());
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        AssertStateFileHasNoRetry();
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(10));  // the 30 min mark: no retry pending, the interval-due tick attempts the fetch
+
+        Assert.Equal(_time.GetUtcNow(), T0 + Interval);
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(2, LogCount("tick reason=Retry"));
+        Assert.Equal(4, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);                  // beyond the ladder nothing shrinks the wait back (no loop)
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);
+        Assert.Equal(0, h.Applier.Calls);                    // newest mode offline never touches the desktop (D-14)
+        AssertStateFileHasNoRetry();
+    }
+
+    [Theory]
+    [InlineData(Settings.DefaultMode)]
+    [InlineData(Settings.RandomMode)]
+    public async Task RetryTick_FetchStillFailing_NeverRotates_BothModes(string mode)
+    {
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(WithMode(mode), SeenState(), cache, Offline());
+        await StartAsync(h);   // not due: NoOp(not-due) + FetchFailed, retry armed at T0 + 5 min
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));
+        await AdvanceAsync(h, TimeSpan.FromMinutes(15));
+
+        Assert.Equal(2, LogCount("tick reason=Retry"));
+        Assert.Equal(2, LogCount("tick done reason=Retry result=FetchFailed decision=NoOp why=retry"));
+        Assert.Equal(0, h.Applier.Calls);                          // a retry-only tick never changes the desktop (D-13)
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.Equal(0, LogCount("tick reason=Interval"));         // still 10 min short of the schedule
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task Offline_Random_IntervalTick_RotatesToOtherCachedImage()
+    {
+        // The persisted schedule falls due 2 min after launch (a restart late in the interval), well before the ladder
+        // would be exhausted, so the interval-due tick both fails its fetch and rotates from the cache (D-14).
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(RandomMode(), SeenState(dueInMinutes: 2), cache, Offline());
+        await StartAsync(h);
+        Assert.Equal(0, h.Applier.Calls);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(2));
+
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.False(string.Equals(NewestId, h.State.CurrentImageId, StringComparison.Ordinal));
+        Assert.DoesNotContain(NewestId, h.Applier.LastPath!);
+        Assert.Contains(h.State.CurrentImageId!.Substring(4), h.Applier.LastPath!);   // CacheFileName drops the OHR. prefix
+        Assert.Equal(NewestId, h.State.LastSeenNewestId);                             // rotating the cache never marks anything seen (D-03)
+
+        string doneLine = LogText().Split('\n').Single(l => l.Contains("tick done reason=Interval", StringComparison.Ordinal));
+        Assert.Contains("result=Applied decision=Random why=interval", doneLine);
+        Assert.DoesNotContain("retry=-", doneLine);                                   // the failure stays visible next to the apply
+        Assert.Contains($"retry={(_time.GetUtcNow() + TimeSpan.FromMinutes(15)):O}", doneLine);
+        Assert.Equal(2, h.Service.FailureStage);
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);
+
+        // Still offline: the next interval-due tick keeps rotating on the normal cadence, retries in between never do.
+        string afterFirst = h.State.CurrentImageId!;
+        await AdvanceAsync(h, Interval);
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.False(string.Equals(afterFirst, h.State.CurrentImageId, StringComparison.Ordinal));
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(1, LogCount("why=retry"));
+    }
+
+    [Fact]
+    public async Task Offline_Newest_IntervalTick_LeavesDesktopUntouched()
+    {
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(Newest(), SeenState(dueInMinutes: 2), cache, Offline());
+        await StartAsync(h);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(2));
+
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.Contains("tick done reason=Interval result=FetchFailed decision=NoOp why=unchanged", LogText());
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);   // the schedule still moves on (no every-minute retry)
+
+        await AdvanceAsync(h, Interval);
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Equal(0, h.Applier.Calls);
+    }
+
+    [Fact]
+    public async Task Offline_SingleImage_Random_BehavesAsNewest()
+    {
+        ImageCache cache = SeedCache([Cached(NewestId, "2026-09-20")], applied: NewestId);
+        Harness h = Build(RandomMode(), SeenState(dueInMinutes: 2), cache, Offline());
+        await StartAsync(h);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(2));
+        await AdvanceAsync(h, Interval);
+
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Equal(2, LogCount("tick done reason=Interval result=FetchFailed decision=NoOp why=unchanged"));
+        Assert.Equal(0, h.Applier.Calls);                    // ROT-03: one cached image, random behaves as newest
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+    }
+
+    [Fact]
+    public async Task NetworkReturns_FirstSuccessAppliesNewest_ResetsStage()
+    {
+        // The desktop shows an older image (the last one seen before going offline); the fixture catalog's newest is
+        // AlphornBavaria, which the first successful fetch must apply (CACHE-04, D-14).
+        var network = new Network { Online = false };
+        ImageCache cache = SeedCache([Cached(OldestId, "2026-09-14")], applied: OldestId);
+        Harness h = Build(Newest(), SeenState(current: OldestId), cache, Switchable(network));
+        await StartAsync(h);
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));      // Startup + first Retry both fail
+        Assert.Equal(2, h.Service.FailureStage);
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(20), h.Service.RetryDueUtc);
+
+        network.Online = true;
+        await AdvanceAsync(h, TimeSpan.FromMinutes(15));     // the second Retry tick is the first one that can fetch
+
+        Assert.Equal(2, LogCount("tick reason=Retry"));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", h.Applier.LastPath!);
+        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(0, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+        Assert.Contains("tick done reason=Retry result=Applied decision=ApplyNew why=new", LogText());
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);   // a Retry tick applies but never re-arms the schedule
+        Assert.Equal(NewestId, SavedState()!.LastSeenNewestId);
+        AssertStateFileHasNoRetry();
+    }
+
+    [Fact]
+    public async Task NetworkAvailable_PullsRetryToDebounce()
+    {
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(Newest(), SeenState(), cache, Offline());
+        await StartAsync(h);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+
+        h.Service.OnNetworkAvailable();
+
+        Assert.Equal(_time.GetUtcNow() + ScheduleMath.ResumeDebounce, h.Service.RetryDueUtc);
+        Assert.Contains("schedule nudge source=network", LogText());
+        Assert.Equal(1, h.Service.FailureStage);              // only the due time moves; the ladder position is unchanged
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task NetworkAvailable_RetryRunsOnTheNudgedBeat_BeatExact()
+    {
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(Newest(), SeenState(), cache, Offline());
+        await StartAsync(h);
+        h.Service.OnNetworkAvailable();
+        DateTimeOffset pulled = h.Service.RetryDueUtc!.Value;
+
+        // One second before the nudged beat: nothing has fired, the pulled-forward time is untouched.
+        await AdvanceAsync(h, ScheduleMath.ResumeDebounce - TimeSpan.FromSeconds(1));
+        Assert.Equal(0, LogCount("tick reason=Retry"));
+        Assert.Equal(pulled, h.Service.RetryDueUtc);
+
+        // Land exactly on the beat (never past it): the beat re-armed by the nudge must itself find the retry due,
+        // which only holds while the pull-forward lead is <= the debounce the nudge used.
+        await AdvanceAsync(h, TimeSpan.FromSeconds(1));
+        Assert.Equal(pulled, _time.GetUtcNow());
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(2, h.Service.FailureStage);
+    }
+
+    [Fact]
+    public async Task Offline_LastCheckUtc_AdvancesOnFailedAttempts()
+    {
+        ImageCache cache = SeedCache(ThreeCached(), applied: NewestId);
+        Harness h = Build(Newest(), SeenState(), cache, Offline());
+
+        await StartAsync(h);
+        Assert.Equal(T0, h.State.LastCheckUtc);            // RESEARCH A4: every attempt counts as a check
+        Assert.Equal(T0, SavedState()!.LastCheckUtc);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(_time.GetUtcNow(), h.State.LastCheckUtc);
+        Assert.Equal(_time.GetUtcNow(), SavedState()!.LastCheckUtc);
+    }
+
+    [Fact]
+    public async Task EmptyCache_NoCurrent_Offline_NoOpEmptyCache_NoThrow()
+    {
+        Harness h = Build(Newest(), new AppState(), SeedCache([]), Offline());
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.Equal(TickResult.FetchFailed, result);
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Null(h.State.CurrentImageId);
+        Assert.Contains("tick done reason=Startup result=FetchFailed decision=NoOp why=empty-cache", LogText());
+        Assert.Equal(0, LogCount("tick failed"));
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);   // the ladder still arms so the first fetch is retried soon
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
     }
 }

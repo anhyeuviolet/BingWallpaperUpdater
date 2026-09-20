@@ -38,10 +38,11 @@ public sealed class RotationService : IDisposable
     private readonly object _sync = new();
 
     private ITimer? _heartbeat;
-#pragma warning disable CS0169, CS0649 // assigned by the Plan 02-02 retry ladder (D-13); kept in memory only so a restart begins again at 5 min
-    private DateTimeOffset? _retryDueUtc;   // in-memory backoff due time; never written into the persisted NextDueUtc
-    private int _failureStage;
-#pragma warning restore CS0169, CS0649
+
+    // The retry ladder (D-13) lives in memory only — never in AppState / state.json — so a restart begins again at
+    // 5 min and the persisted NextDueUtc always means the schedule, never a backoff. Both guarded by _sync.
+    private DateTimeOffset? _retryDueUtc;   // in-memory backoff due time; null when no retry is pending
+    private int _failureStage;               // 0 after any successful fetch; +1 per failed fetch
     private bool _startupTickDone;
     private volatile bool _disposed;
     private CancellationToken _ct;
@@ -85,8 +86,29 @@ public sealed class RotationService : IDisposable
     /// <summary>Mirrors <see cref="AppState.NextDueUtc"/>.</summary>
     public DateTimeOffset? NextDueUtc => _state.NextDueUtc;
 
-    /// <summary>In-memory backoff due time; null when no retry is pending (D-13).</summary>
-    public DateTimeOffset? RetryDueUtc => _retryDueUtc;
+    /// <summary>In-memory backoff due time; null when no retry is pending (D-13). Never persisted.</summary>
+    public DateTimeOffset? RetryDueUtc
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _retryDueUtc;
+            }
+        }
+    }
+
+    /// <summary>Consecutive failed fetches: 0 after any successful fetch; 1 and 2 arm the 5 / 15 min retries, 3+ wait for the interval (D-13).</summary>
+    public int FailureStage
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _failureStage;
+            }
+        }
+    }
 
     /// <summary>
     /// Creates the heartbeat: the first callback after <paramref name="initialDelay"/> runs the
@@ -173,8 +195,31 @@ public sealed class RotationService : IDisposable
         Nudge("time-changed");
     }
 
-    /// <summary>Any thread: the network came back — check the schedule soon (Plan 02-02 adds the retry pull-forward).</summary>
-    public void OnNetworkAvailable() => Nudge("network");
+    /// <summary>
+    /// Any thread: the network came back. A pending retry is pulled forward to <c>now + <see cref="ScheduleMath.ResumeDebounce"/></c>
+    /// — deliberately the same constant <see cref="Nudge"/> re-arms the heartbeat to, so the nudged beat itself finds
+    /// the retry due (any longer lead would make that beat see "not yet due" and slip the retry to the next 60 s beat).
+    /// The clock is read before the nudge so the retry can never be later than the re-armed beat. Without a pending
+    /// retry this is only a nudge; the <c>IsDue</c> gate keeps a flood of signals from producing a burst (T-02-08).
+    /// </summary>
+    public void OnNetworkAvailable()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        DateTimeOffset now = _time.GetUtcNow();
+        lock (_sync)
+        {
+            if (_retryDueUtc is not null)
+            {
+                _retryDueUtc = now + ScheduleMath.ResumeDebounce;
+            }
+        }
+
+        Nudge("network");
+    }
 
     /// <summary>Test/diagnostic helper: completes once no tick holds the gate.</summary>
     public async Task WaitForIdleAsync(CancellationToken ct = default)
@@ -206,9 +251,11 @@ public sealed class RotationService : IDisposable
         }
 
         DateTimeOffset now = _time.GetUtcNow();
+        DateTimeOffset? retryDue;
         lock (_sync)
         {
             _state.NextDueUtc = ScheduleMath.ClampAfterClockChange(now, _state.NextDueUtc, _settings.Interval);   // D-07, idempotent
+            retryDue = _retryDueUtc;
         }
 
         if (!_startupTickDone)
@@ -217,7 +264,8 @@ public sealed class RotationService : IDisposable
             return;
         }
 
-        if (_retryDueUtc is { } retry && now >= retry)
+        // Retry before Interval (D-13): a beat dispatches at most one tick, and both go through the same gate.
+        if (retryDue is { } retry && now >= retry)
         {
             _ = RunTickAsync(TickReason.Retry, _ct);
             return;
@@ -303,14 +351,9 @@ public sealed class RotationService : IDisposable
         }
 
         // 5. re-arm
+        DateTimeOffset? retryDue;
         lock (_sync)
         {
-            if (fetchFailed)
-            {
-                // The 5 / 15 min ladder arrives in Plan 02-02; this plan only reports the result.
-                result = TickResult.FetchFailed;
-            }
-
             // Next re-arms only when it applied (D-05); Startup/Interval re-arm when the schedule was due (RESEARCH A3,
             // Pitfall 4) — even after a failed apply, so a COM failure cannot make the heartbeat retry every minute;
             // Retry never touches the schedule (D-13).
@@ -319,12 +362,43 @@ public sealed class RotationService : IDisposable
             {
                 _state.NextDueUtc = ScheduleMath.Rearm(now, _settings.Interval);
             }
+
+            // The ladder (D-13): 5 min after the first failure, 15 min after the second, then nothing until the
+            // interval-due tick — the stage keeps counting so later failures never shrink the wait back (T-02-08).
+            // A random rotation that followed the failed fetch still reports Applied; the retry= token shows the failure.
+            if (fetchFailed)
+            {
+                TimeSpan? delay = ScheduleMath.RetryDelay(_failureStage);
+                _failureStage++;
+                _retryDueUtc = delay is { } d ? now + d : null;
+                if (_retryDueUtc is { } scheduled)
+                {
+                    Log.Info($"retry scheduled stage={_failureStage} at={scheduled:O}");
+                }
+                else
+                {
+                    Log.Info($"retry exhausted stage={_failureStage} next={_state.NextDueUtc?.ToString("O") ?? "-"}");
+                }
+
+                if (path is null)
+                {
+                    result = TickResult.FetchFailed;
+                }
+            }
+            else
+            {
+                _failureStage = 0;
+                _retryDueUtc = null;
+            }
+
+            retryDue = _retryDueUtc;
         }
 
-        // 6. persist — after ApplyStage's own save, on every path including NoOp and FetchFailed (ROT-07).
+        // 6. persist — after ApplyStage's own save, on every path including NoOp and FetchFailed (ROT-07). The retry
+        // time is not part of AppState, so state.json never carries it.
         _startupTickDone = true;
         TrySaveState();
-        Log.Info($"tick done reason={reason} result={result} decision={decision.Kind} why={decision.Why} next={_state.NextDueUtc?.ToString("O") ?? "-"} retry={_retryDueUtc?.ToString("O") ?? "-"}");
+        Log.Info($"tick done reason={reason} result={result} decision={decision.Kind} why={decision.Why} next={_state.NextDueUtc?.ToString("O") ?? "-"} retry={retryDue?.ToString("O") ?? "-"}");
         return result;
     }
 
