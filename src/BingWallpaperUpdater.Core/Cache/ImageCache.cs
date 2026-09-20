@@ -204,10 +204,22 @@ public sealed class ImageCache
     private bool IsFileNamedByIndex(string file) =>
         Index.Images.Any(i => string.Equals(i.File, file, StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>Records the image currently set on the desktop (single entry in Phase 1) and saves.</summary>
+    /// <summary>
+    /// Records the image about to be set on the desktop (single entry in Phase 1) and saves. Call it BEFORE the
+    /// desktop changes so the eviction protection is on disk first (WR-07); <see cref="RestoreApplied"/> undoes it
+    /// when the apply does not happen.
+    /// </summary>
     public void MarkApplied(ImageId id)
     {
         Index.Applied = [id.Value];
+        Save();
+    }
+
+    /// <summary>Puts back an earlier <see cref="CacheIndex.Applied"/> set (the desktop still shows it) and saves.</summary>
+    public void RestoreApplied(IEnumerable<string> ids)
+    {
+        ArgumentNullException.ThrowIfNull(ids);
+        Index.Applied = [.. ids];
         Save();
     }
 

@@ -84,23 +84,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// Runs <see cref="ApplyStage"/> on the STA thread: the index protection is persisted before the desktop
+    /// changes, the record is rolled back on a failed apply, and <c>apply ok</c> is logged only once everything is
+    /// on disk (WR-07). Failure and rollback logging live in the stage; this only owns the adapter and the catch.
+    /// </summary>
     private static void ApplyOnUiThread(string absolutePath, ImageId id, ImageCache cache, AppState state)
     {
         try
         {
             IWallpaperApplier applier = new DesktopWallpaperApplier();
-            ApplyResult apply = applier.Apply(absolutePath);
-            if (!apply.Ok)
-            {
-                Log.Warn($"apply failed method={apply.Method} error={apply.Error}");
-                return;
-            }
-
-            Log.Info($"apply ok method={apply.Method} id={id} path={absolutePath} readback={apply.ReadBackPath ?? "-"} position={apply.Position ?? "-"}");
-            cache.MarkApplied(id);
-            state.CurrentImageId = id.Value;
-            state.LastAppliedUtc = DateTimeOffset.UtcNow;
-            state.Save(AppPaths.StatePath);
+            ApplyStage.Run(applier, absolutePath, id, cache, state, AppPaths.StatePath);
         }
         catch (Exception ex)
         {

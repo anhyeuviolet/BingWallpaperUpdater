@@ -109,7 +109,8 @@ function Wait-LogLine {
     Fail "no line matching '$Pattern' within $TimeoutSec s"
 }
 
-# "apply ok" is logged before MarkApplied/state.Save; wait until the index carries the applied id.
+# "apply ok" is logged only after MarkApplied/state.Save (WR-07), so the index already carries the applied id
+# by the time the line appears; this wait stays as a guard against log/file write reordering on disk.
 function Wait-Applied([string]$ImageId, [int]$TimeoutSec = 15) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
