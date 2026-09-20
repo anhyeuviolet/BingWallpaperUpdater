@@ -103,4 +103,66 @@ public sealed class MarkdownCatalogParserTests
         Assert.NotNull(today);
         Assert.Equal(rows[0].Id, today.Value.Id);
     }
+
+    // ---- monthly archive fixture (SRC-02) -----------------------------------------------------------
+
+    private static readonly string MonthlyFixturePath = Path.Combine(AppContext.BaseDirectory, "Fixtures", "picture-2026-09.sample.md");
+
+    private static string MonthlyFixture() => File.ReadAllText(MonthlyFixturePath);
+
+    [Fact]
+    public void Parse_MonthlyFixture_YieldsAtLeastTwentyRowsAndIgnoresHeader()
+    {
+        string markdown = MonthlyFixture();
+        Assert.StartsWith("## Bing Wallpaper (2026-09)", markdown, StringComparison.Ordinal);
+
+        IReadOnlyList<CatalogEntry> rows = MarkdownCatalogParser.Parse(markdown);
+
+        Assert.True(rows.Count >= 20, $"expected >= 20 rows, got {rows.Count}");
+        Assert.All(rows, r =>
+        {
+            Assert.StartsWith("2026-09-", r.Date, StringComparison.Ordinal);
+            Assert.Equal(CatalogSources.GitHub, r.Source);
+            Assert.Null(r.Title);
+        });
+        Assert.Equal(rows.Count, rows.Select(r => r.Id.Value).Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public void Parse_MonthlyFixture_CrlfAndLfBodiesYieldIdenticalIds()
+    {
+        string lf = MonthlyFixture().Replace("\r\n", "\n", StringComparison.Ordinal);
+        string crlf = lf.Replace("\n", "\r\n", StringComparison.Ordinal);
+        Assert.NotEqual(lf, crlf);
+
+        IReadOnlyList<CatalogEntry> fromLf = MarkdownCatalogParser.Parse(lf);
+        IReadOnlyList<CatalogEntry> fromCrlf = MarkdownCatalogParser.Parse(crlf);
+
+        Assert.NotEmpty(fromLf);
+        Assert.Equal(fromLf.Select(r => r.Id.Value), fromCrlf.Select(r => r.Id.Value));
+        Assert.Equal(fromLf.Select(r => r.Date), fromCrlf.Select(r => r.Date));
+    }
+
+    [Fact]
+    public void ParseToday_MonthlyFixture_ReturnsCopyrightOfNewestRow()
+    {
+        string markdown = MonthlyFixture();
+
+        (ImageId Id, string Copyright)? today = MarkdownCatalogParser.ParseToday(markdown);
+        IReadOnlyList<CatalogEntry> rows = MarkdownCatalogParser.Parse(markdown);
+
+        Assert.NotNull(today);
+        Assert.Equal(rows[0].Id, today.Value.Id);
+        Assert.False(string.IsNullOrWhiteSpace(today.Value.Copyright));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   \r\n\t")]
+    [InlineData("## Bing Wallpaper (2026-09)\r\n\r\n|      |      |      |\r\n")]
+    public void Parse_EmptyOrRowlessMonthly_ReturnsEmptyListWithoutThrowing(string markdown)
+    {
+        Assert.Empty(MarkdownCatalogParser.Parse(markdown));
+        Assert.Null(MarkdownCatalogParser.ParseToday(markdown));
+    }
 }

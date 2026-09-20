@@ -26,6 +26,18 @@ public sealed class CatalogService
         _readmeUrl = readmeUrlOverride ?? BingImageUrl.CatalogReadme();
     }
 
+    /// <summary>True once a 429 from raw.githubusercontent.com switched this process to HPImageArchive only.</summary>
+    public bool GitHubDisabledForSession => throw new NotImplementedException();
+
+    /// <summary>Full enriched list, newest first. Implemented in the GREEN step of Plan 02 Task 1.</summary>
+    public Task<IReadOnlyList<CatalogEntry>> GetCatalogAsync(string market, CancellationToken ct) => throw new NotImplementedException();
+
+    /// <summary>Monthly archive rows (SRC-02), no enrichment. Implemented in the GREEN step of Plan 02 Task 1.</summary>
+    public Task<IReadOnlyList<CatalogEntry>> GetMonthAsync(int year, int month, CancellationToken ct) => throw new NotImplementedException();
+
+    /// <summary>Pages HPImageArchive idx 0..7 with n=8 until <paramref name="count"/> entries. Implemented in the GREEN step.</summary>
+    public Task<IReadOnlyList<CatalogEntry>> GetArchivePagesAsync(string market, int count, CancellationToken ct) => throw new NotImplementedException();
+
     /// <summary>The newest catalog entry, or null when nothing could be determined (already logged).</summary>
     public async Task<CatalogEntry?> GetNewestAsync(string market, CancellationToken ct)
     {
