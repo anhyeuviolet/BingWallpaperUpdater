@@ -28,7 +28,7 @@ public sealed class HttpGateway : IDisposable
     /// </summary>
     public string DownloadRoot { get; set; } = Io.AppPaths.CacheDir;
 
-    public HttpGateway(HttpMessageHandler? handler = null, string? userAgent = null)
+    public HttpGateway(HttpMessageHandler? handler = null, string? userAgent = null, RetryPolicy? retry = null)
     {
         handler ??= new SocketsHttpHandler
         {
