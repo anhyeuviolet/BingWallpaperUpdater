@@ -20,7 +20,11 @@ namespace BingWallpaperUpdater.Core.Pipeline;
 /// </summary>
 public static class ApplyStage
 {
-    public static ApplyResult Run(IWallpaperApplier applier, string absolutePath, ImageId id, ImageCache cache, AppState state, string statePath)
+    /// <param name="appliedUtc">
+    /// The time recorded as <see cref="AppState.LastAppliedUtc"/>; the scheduler passes its <see cref="TimeProvider"/>
+    /// reading so fake-clock tests are deterministic. Null (the Phase 1 callers) falls back to the wall clock.
+    /// </param>
+    public static ApplyResult Run(IWallpaperApplier applier, string absolutePath, ImageId id, ImageCache cache, AppState state, string statePath, DateTimeOffset? appliedUtc = null)
     {
         ArgumentNullException.ThrowIfNull(applier);
         ArgumentException.ThrowIfNullOrEmpty(absolutePath);
@@ -62,7 +66,7 @@ public static class ApplyStage
 
         // 3. Secondary record; never undoes a change that already happened.
         state.CurrentImageId = id.Value;
-        state.LastAppliedUtc = DateTimeOffset.UtcNow;
+        state.LastAppliedUtc = appliedUtc ?? DateTimeOffset.UtcNow;
         try
         {
             state.Save(statePath);

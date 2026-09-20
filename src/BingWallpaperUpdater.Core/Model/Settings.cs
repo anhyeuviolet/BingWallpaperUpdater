@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Io;
@@ -15,9 +16,22 @@ public sealed partial class Settings
 {
     public const string DefaultMarket = "en-US";
     public const string DefaultResolution = "UHD";
+    public const int DefaultIntervalMinutes = 30;
+    public const string DefaultMode = "newest";
+    public const string RandomMode = "random";
 
     /// <summary>The resolutions the pipeline knows how to request and validate (see <c>BingImageUrl.MinDimensions</c>).</summary>
     public static readonly IReadOnlyList<string> KnownResolutions = ["UHD", "1920x1200", "1920x1080"];
+
+    /// <summary>
+    /// The rotation intervals the scheduler accepts, in minutes (ROT-01): 30 min, 1 h, 2 h, 4 h, 8 h, daily. Anything
+    /// else in the hand-edited file falls back to <see cref="DefaultIntervalMinutes"/>; the 30 min floor is also what
+    /// keeps a hand-edited <c>intervalMinutes: 1</c> from hammering GitHub and Bing (T-02-01).
+    /// </summary>
+    public static readonly IReadOnlyList<int> AllowedIntervals = [30, 60, 120, 240, 480, 1440];
+
+    /// <summary>Rotation modes (ROT-02, ROT-03): <c>newest</c> follows the catalog, <c>random</c> rotates the cache.</summary>
+    public static readonly IReadOnlyList<string> KnownModes = [DefaultMode, RandomMode];
 
     public int SchemaVersion { get; set; } = 1;
 
@@ -26,6 +40,20 @@ public sealed partial class Settings
 
     /// <summary>"UHD" (original <c>_UHD.jpg</c>), "1920x1200" or "1920x1080".</summary>
     public string Resolution { get; set; } = DefaultResolution;
+
+    /// <summary>Rotation interval in minutes, one of <see cref="AllowedIntervals"/> (D-08).</summary>
+    public int IntervalMinutes { get; set; } = DefaultIntervalMinutes;
+
+    /// <summary><c>newest</c> (default) or <c>random</c>, canonical lower case (D-08).</summary>
+    public string Mode { get; set; } = DefaultMode;
+
+    /// <summary>The interval as a <see cref="TimeSpan"/>; computed, never serialised.</summary>
+    [JsonIgnore]
+    public TimeSpan Interval => TimeSpan.FromMinutes(IntervalMinutes);
+
+    /// <summary>True when <see cref="Mode"/> is <see cref="RandomMode"/>; computed, never serialised.</summary>
+    [JsonIgnore]
+    public bool IsRandomMode => string.Equals(Mode, RandomMode, StringComparison.Ordinal);
 
     // Two ASCII letters, a hyphen, two ASCII letters — the only shape the Bing mkt parameter takes.
     [GeneratedRegex("^[A-Za-z]{2}-[A-Za-z]{2}$", RegexOptions.CultureInvariant)]
@@ -99,6 +127,29 @@ public sealed partial class Settings
         else if (!string.Equals(known, Resolution, StringComparison.Ordinal))
         {
             Resolution = known;
+            changed = true;
+        }
+
+        if (!AllowedIntervals.Contains(IntervalMinutes))
+        {
+            Log.Warn($"settings invalid field=IntervalMinutes value={IntervalMinutes} using={DefaultIntervalMinutes}");
+            IntervalMinutes = DefaultIntervalMinutes;
+            changed = true;
+        }
+
+        string? mode = Mode?.Trim();
+        string? knownMode = mode is null
+            ? null
+            : KnownModes.FirstOrDefault(m => string.Equals(m, mode, StringComparison.OrdinalIgnoreCase));
+        if (knownMode is null)
+        {
+            Log.Warn($"settings invalid field=Mode value={Describe(Mode)} using={DefaultMode}");
+            Mode = DefaultMode;
+            changed = true;
+        }
+        else if (!string.Equals(knownMode, Mode, StringComparison.Ordinal))
+        {
+            Mode = knownMode;
             changed = true;
         }
 

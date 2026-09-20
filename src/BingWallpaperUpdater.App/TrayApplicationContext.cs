@@ -5,20 +5,22 @@ using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Io;
 using BingWallpaperUpdater.Core.Model;
 using BingWallpaperUpdater.Core.Net;
-using BingWallpaperUpdater.Core.Pipeline;
 using BingWallpaperUpdater.Core.Ports;
+using BingWallpaperUpdater.Core.Rotation;
+using BingWallpaperUpdater.Core.Scheduling;
 using BingWallpaperUpdater.Windows.Wallpaper;
 using Microsoft.Win32;
 
 namespace BingWallpaperUpdater.App;
 
 /// <summary>
-/// The tray shell: one <see cref="NotifyIcon"/> with an Exit item, no window ever. The launch-time pipeline
-/// runs on the thread pool and only the COM apply hops back to this (STA) thread via the captured
-/// <see cref="SynchronizationContext"/>. Every exit path (Exit menu, thread/unhandled exception, session
-/// ending) funnels through <see cref="Shutdown"/>, which logs once, hides and disposes the icon, then ends
-/// the message loop. <see cref="Dispose(bool)"/> is idempotent because WinForms disposes the context again
-/// when the loop ends (RESEARCH Pitfall 4).
+/// The tray shell: one <see cref="NotifyIcon"/> with "Next wallpaper" / separator / "Exit" (D-15), no window ever.
+/// It owns the process-lifetime services and the <see cref="RotationService"/> whose heartbeat drives every tick on
+/// the thread pool; only the COM apply hops back to this (STA) thread through <see cref="WinFormsUiDispatcher"/>.
+/// Every exit path (Exit menu, thread/unhandled exception, session ending) funnels through <see cref="Shutdown"/>,
+/// which logs once, stops the heartbeat, hides and disposes the icon, then ends the message loop.
+/// <see cref="Dispose(bool)"/> is idempotent because WinForms disposes the context again when the loop ends
+/// (RESEARCH Pitfall 4).
 /// </summary>
 [SupportedOSPlatform("windows8.0")]
 internal sealed class TrayApplicationContext : ApplicationContext
@@ -26,13 +28,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _icon;
     private readonly CancellationTokenSource _cts = new();
     private readonly SessionEndingEventHandler _sessionEnding;
+    private readonly HttpGateway _http;
+    private readonly RotationService _rotation;
     private int _shutdownRequested;
     private bool _disposed;
 
-    public TrayApplicationContext()
+    /// <param name="startup">True when launched with <c>--startup</c>: the first tick waits 30-60 s (D-12).</param>
+    public TrayApplicationContext(bool startup)
     {
+        // The menu and icon come first: creating the first WinForms control is what installs the
+        // WindowsFormsSynchronizationContext that the dispatcher captures below.
         var menu = new ContextMenuStrip();
+        var next = new ToolStripMenuItem("Next wallpaper");
+        next.Click += (_, _) => _ = _rotation.RunTickAsync(TickReason.Next, _cts.Token);
+        menu.Items.Add(next);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Shutdown("exit"));
+        menu.Opening += (_, _) => next.Enabled = !_rotation.IsTickRunning;   // D-05: disabled while a tick runs
 
         _icon = new NotifyIcon
         {
@@ -48,58 +60,19 @@ internal sealed class TrayApplicationContext : ApplicationContext
         SynchronizationContext ui = SynchronizationContext.Current
             ?? throw new InvalidOperationException("no WinForms synchronization context on the UI thread");
 
-        _ = Task.Run(() => RunPipelineAsync(ui, _cts.Token));
-    }
+        _http = new HttpGateway();
+        Settings settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
+        AppState state = AppState.LoadOrCreate(AppPaths.StatePath);
+        var cache = new ImageCache(AppPaths.CacheDir, AppPaths.IndexPath);
+        cache.Reconcile();   // CACHE-05: once per launch, before the first tick
+        var catalog = new CatalogService(_http, state, AppPaths.CatalogBodyPath);
+        IWallpaperApplier applier = new DesktopWallpaperApplier();
+        var dispatcher = new WinFormsUiDispatcher(ui);
+        _rotation = new RotationService(settings, state, AppPaths.StatePath, catalog, cache, _http, applier, dispatcher);
 
-    private static async Task RunPipelineAsync(SynchronizationContext ui, CancellationToken ct)
-    {
-        try
-        {
-            using var http = new HttpGateway();
-            Settings settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
-            AppState state = AppState.LoadOrCreate(AppPaths.StatePath);
-            var cache = new ImageCache(AppPaths.CacheDir, AppPaths.IndexPath);
-            cache.Load();
-            var catalog = new CatalogService(http, state, AppPaths.CatalogBodyPath);
-
-            (string AbsolutePath, ImageId Id)? result =
-                await FirstRunPipeline.EnsureTodayAsync(settings, state, catalog, cache, http, ct).ConfigureAwait(false);
-
-            // Persist the catalog ETag/fetch time whether or not a download followed.
-            state.Save(AppPaths.StatePath);
-
-            if (result is null)
-            {
-                return; // already logged; the desktop is left untouched
-            }
-
-            ui.Post(_ => ApplyOnUiThread(result.Value.AbsolutePath, result.Value.Id, cache, state), null);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"pipeline failed stage=download error={ex.Message}", ex);
-        }
-    }
-
-    /// <summary>
-    /// Runs <see cref="ApplyStage"/> on the STA thread: the index protection is persisted before the desktop
-    /// changes, the record is rolled back on a failed apply, and <c>apply ok</c> is logged only once everything is
-    /// on disk (WR-07). Failure and rollback logging live in the stage; this only owns the adapter and the catch.
-    /// </summary>
-    private static void ApplyOnUiThread(string absolutePath, ImageId id, ImageCache cache, AppState state)
-    {
-        try
-        {
-            IWallpaperApplier applier = new DesktopWallpaperApplier();
-            ApplyStage.Run(applier, absolutePath, id, cache, state, AppPaths.StatePath);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"pipeline failed stage=apply error={ex.Message}", ex);
-        }
+        TimeSpan initialDelay = startup ? TimeSpan.FromSeconds(Random.Shared.Next(30, 61)) : TimeSpan.Zero;
+        Log.Info($"schedule start launch={(startup ? "autostart" : "manual")} firstTickIn={(int)initialDelay.TotalSeconds}s interval={settings.IntervalMinutes} mode={settings.Mode}");
+        _rotation.Start(initialDelay, _cts.Token);
     }
 
     private static Icon LoadTrayIcon()
@@ -130,8 +103,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _disposed = true;
             SystemEvents.SessionEnding -= _sessionEnding;
             _cts.Cancel();
+            _rotation.Dispose();
             _icon.Visible = false;
             _icon.Dispose();
+            _http.Dispose();
             _cts.Dispose();
         }
 
