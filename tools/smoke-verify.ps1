@@ -208,7 +208,7 @@ if (@($index.applied).Count -ne 1 -or @($index.applied)[0] -ne $img.id) { Fail "
 
 $jpgs = @(Get-CacheJpegs)
 if ($jpgs.Count -ne 1) { Fail "expected exactly 1 *.jpg in cache, found $($jpgs.Count)" }
-if ($jpgs[0].Name -notmatch '^\d{4}-\d{2}-\d{2}_[A-Za-z0-9]+\.jpg$') { Fail "cache file name '$($jpgs[0].Name)' does not match yyyy-MM-dd_Name.jpg" }
+if ($jpgs[0].Name -notmatch '^\d{4}-\d{2}-\d{2}_[A-Za-z0-9]+_[A-Z]{2}-[A-Z]{2}[0-9]+\.jpg$') { Fail "cache file name '$($jpgs[0].Name)' does not match yyyy-MM-dd_Name_MARKETdigits.jpg" }
 if ($jpgs[0].Name -ne $img.file) { Fail "cache file '$($jpgs[0].Name)' differs from index file '$($img.file)'" }
 Assert-NoLeftovers
 

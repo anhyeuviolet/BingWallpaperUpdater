@@ -29,7 +29,10 @@ public sealed class CachedImage
     public int Width { get; set; }
     public int Height { get; set; }
 
-    /// <summary>File name relative to the cache directory, e.g. <c>2026-09-20_AlphornBavaria.jpg</c>.</summary>
+    /// <summary>
+    /// File name relative to the cache directory, e.g. <c>2026-09-20_AlphornBavaria_EN-US6200857270.jpg</c>
+    /// (earlier builds wrote <c>2026-09-20_AlphornBavaria.jpg</c>; whatever is recorded here is what the entry owns).
+    /// </summary>
     public string File { get; set; } = string.Empty;
     public long Bytes { get; set; }
     public string SourceUrl { get; set; } = string.Empty;

@@ -189,6 +189,47 @@ public sealed class ImageCacheEvictionTests : IDisposable
         Assert.Contains("evict id=OHR.Image2_EN-US2", LogText());
     }
 
+    /// <summary>
+    /// WR-01: an index from an earlier build can hold two IDs that share one file (the old naming dropped market and
+    /// suffix). Evicting one of them must not delete the bytes the other — here the applied image — still points at.
+    /// </summary>
+    [Fact]
+    public void Add_VictimSharesItsFileWithASurvivingEntry_FileIsKeptAndTheSkipIsLogged()
+    {
+        List<CachedImage> ten = Ascending(10);
+        // Image 2 (oldest unprotected) and image 10 (applied) both name the same legacy-style file.
+        const string shared = "2026-09-01_Shared.jpg";
+        ten[1].File = shared;
+        ten[9].File = shared;
+        foreach (CachedImage image in ten)
+        {
+            File.WriteAllBytes(Path.Combine(_dir, image.File), new byte[16]);
+        }
+
+        string indexPath = Path.Combine(_dir, "index.json");
+        AtomicJsonFile.Save(indexPath, new CacheIndex { Applied = [ten[9].Id], Images = ten }, CoreJsonContext.Default.CacheIndex);
+        var cache = new ImageCache(_dir, indexPath);
+        cache.Load();
+        CachedImage eleventh = Image(11, 11);
+        File.WriteAllBytes(Path.Combine(_dir, eleventh.File), new byte[16]);
+
+        cache.Add(eleventh);
+
+        Assert.DoesNotContain(cache.Index.Images, i => i.Id == "OHR.Image1_EN-US1");
+        Assert.False(File.Exists(Path.Combine(_dir, "2026-09-01_Image1.jpg")), "the unshared oldest image is evicted normally");
+        Assert.Equal(10, cache.Index.Images.Count);
+
+        // Push one more so image 2 becomes the victim while image 10 (applied) still names the same file.
+        CachedImage twelfth = Image(12, 12);
+        File.WriteAllBytes(Path.Combine(_dir, twelfth.File), new byte[16]);
+        cache.Add(twelfth);
+
+        Assert.DoesNotContain(cache.Index.Images, i => i.Id == "OHR.Image2_EN-US2");
+        Assert.Contains(cache.Index.Images, i => i.Id == "OHR.Image10_EN-US10" && i.File == shared);
+        Assert.True(File.Exists(Path.Combine(_dir, shared)), "a file still named by a surviving entry must never be deleted");
+        Assert.Contains($"evict id=OHR.Image2_EN-US2 file={shared} kept=shared", LogText());
+    }
+
     [Fact]
     public void Add_SameIdAndResolution_ReplacesTheEntryInsteadOfDuplicating()
     {

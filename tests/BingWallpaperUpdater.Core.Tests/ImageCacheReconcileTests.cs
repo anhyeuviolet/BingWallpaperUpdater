@@ -216,6 +216,32 @@ public sealed class ImageCacheReconcileTests : IDisposable
         Assert.Contains("reconcile dropped=1 parts=1", LogText());
     }
 
+    /// <summary>
+    /// WR-01: an entry written by an earlier build under the short <c>YYYY-MM-DD_Name.jpg</c> form is neither dropped
+    /// nor renamed — the index says which file it owns, and the applied protection survives with it.
+    /// </summary>
+    [Fact]
+    public void ImageCacheReconcile_LegacyFileNameStillPresent_EntryAndAppliedAreKept()
+    {
+        string indexPath = Path.Combine(_dir, "index.json");
+        Assert.True(ImageId.TryParse("OHR.AlphornBavaria_EN-US6200857270", out ImageId id));
+        CachedImage legacy = Image(1);
+        legacy.Id = id.Value;
+        legacy.File = "2026-09-20_AlphornBavaria.jpg";
+        AtomicJsonFile.Save(indexPath, new CacheIndex { Applied = [id.Value], Images = [legacy] }, CoreJsonContext.Default.CacheIndex);
+        File.WriteAllBytes(Path.Combine(_dir, legacy.File), new byte[16]);
+
+        var cache = new ImageCache(_dir, indexPath);
+        cache.Reconcile();
+
+        CachedImage kept = Assert.Single(cache.Index.Images);
+        Assert.Equal("2026-09-20_AlphornBavaria.jpg", kept.File);
+        Assert.Equal([id.Value], cache.Index.Applied);
+        Assert.True(File.Exists(Path.Combine(_dir, "2026-09-20_AlphornBavaria.jpg")));
+        Assert.NotNull(cache.TryGet(id, "UHD"));
+        Assert.Contains("reconcile dropped=0 parts=0", LogText());
+    }
+
     [Fact]
     public void ImageCacheReconcile_MissingDirectoryAndIndex_YieldsEmptyIndexWithoutThrowing()
     {

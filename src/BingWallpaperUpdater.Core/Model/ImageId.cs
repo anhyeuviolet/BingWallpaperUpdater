@@ -9,7 +9,8 @@ namespace BingWallpaperUpdater.Core.Model;
 /// </summary>
 public readonly partial record struct ImageId(string Value)
 {
-    [GeneratedRegex(@"^OHR\.(?<name>[A-Za-z0-9]+)_(?<market>[A-Z]{2}-[A-Z]{2})(?<digits>\d+)$", RegexOptions.CultureInvariant)]
+    // [0-9] rather than \d: .NET \d matches every Unicode Nd digit, and Digits now enters a cache file name.
+    [GeneratedRegex(@"^OHR\.(?<name>[A-Za-z0-9]+)_(?<market>[A-Z]{2}-[A-Z]{2})(?<digits>[0-9]+)$", RegexOptions.CultureInvariant)]
     private static partial Regex Pattern();
 
     /// <summary>Parses an ID of the form <c>OHR.&lt;Name&gt;_&lt;MARKET&gt;&lt;digits&gt;</c>; anything else is rejected.</summary>
@@ -30,6 +31,9 @@ public readonly partial record struct ImageId(string Value)
 
     /// <summary>The market embedded in the ID, e.g. <c>EN-US</c>.</summary>
     public string Market => Pattern().Match(Value ?? string.Empty) is { Success: true } m ? m.Groups["market"].Value : string.Empty;
+
+    /// <summary>The numeric suffix after the market, e.g. <c>6200857270</c> (ASCII digits only).</summary>
+    public string Digits => Pattern().Match(Value ?? string.Empty) is { Success: true } m ? m.Groups["digits"].Value : string.Empty;
 
     public bool Equals(ImageId other) => string.Equals(Value, other.Value, StringComparison.Ordinal);
 

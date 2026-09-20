@@ -8,11 +8,13 @@ using BingWallpaperUpdater.Core.Net;
 namespace BingWallpaperUpdater.Core.Cache;
 
 /// <summary>
-/// The per-user image cache: <c>cache\index.json</c> plus <c>YYYY-MM-DD_&lt;Name&gt;.jpg</c> files.
-/// The index is the truth — only images listed here are ever applied. This class owns every delete the app
-/// performs: eviction removes only files named in the index, reconcile removes only <c>*.part</c> files inside
-/// the cache directory, and unknown files are never touched (T-01-15). The applied image is never evicted
-/// (CACHE-02; CLAUDE.md "Deleting the wallpaper file after setting it").
+/// The per-user image cache: <c>cache\index.json</c> plus <c>YYYY-MM-DD_&lt;Name&gt;_&lt;MARKET&gt;&lt;digits&gt;.jpg</c>
+/// files (see <see cref="CacheFileName"/>). The index is the truth — only images listed here are ever applied,
+/// and an entry's <see cref="CachedImage.File"/> is honoured whatever naming rule produced it. This class owns
+/// every delete the app performs: eviction removes only files named in the index and never a file another
+/// surviving entry still names, reconcile removes only <c>*.part</c> files inside the cache directory, and
+/// unknown files are never touched (T-01-15). The applied image is never evicted (CACHE-02; CLAUDE.md
+/// "Deleting the wallpaper file after setting it").
 /// </summary>
 public sealed class ImageCache
 {
@@ -82,7 +84,8 @@ public sealed class ImageCache
             && string.Equals(i.Resolution, resolution, StringComparison.Ordinal));
 
     /// <summary>
-    /// <c>{date}_{Name}.jpg</c> for UHD, <c>{date}_{Name}.{w}x{h}.jpg</c> otherwise (see <see cref="CacheFileName"/>).
+    /// <c>{date}_{Name}_{MARKET}{digits}.jpg</c> for UHD, <c>{date}_{Name}_{MARKET}{digits}.{w}x{h}.jpg</c> otherwise
+    /// (see <see cref="CacheFileName"/>).
     /// </summary>
     public string FileNameFor(CatalogEntry entry, string resolution, DateTimeOffset nowUtc) =>
         CacheFileName.For(entry, resolution, nowUtc);
@@ -150,8 +153,9 @@ public sealed class ImageCache
 
     /// <summary>
     /// Appends <paramref name="image"/> (replacing any entry with the same id + resolution), evicts down to
-    /// <see cref="MaxImages"/> with <c>Applied ∪ {image.Id}</c> protected, deletes each victim's file best-effort,
-    /// logs <c>evict id= file=</c> per victim, and saves the index exactly once at the end.
+    /// <see cref="MaxImages"/> with <c>Applied ∪ {image.Id}</c> protected, deletes each victim's file best-effort
+    /// — unless a surviving entry still names that file, in which case the bytes stay — logs <c>evict id= file=</c>
+    /// per victim, and saves the index exactly once at the end.
     /// </summary>
     public CachedImage Add(CachedImage image)
     {
@@ -176,21 +180,32 @@ public sealed class ImageCache
         {
             bool sameFile = string.Equals(old.File, image.File, StringComparison.OrdinalIgnoreCase);
             bool applied = Index.Applied.Contains(old.Id, StringComparer.Ordinal);
-            bool stillReferenced = Index.Images.Any(i => string.Equals(i.File, old.File, StringComparison.OrdinalIgnoreCase));
-            if (!sameFile && !applied && !stillReferenced)
+            if (!sameFile && !applied && !IsFileNamedByIndex(old.File))
             {
                 DeleteVictimFile(old);
             }
         }
 
+        // A victim's file is deleted only when no surviving entry names it. File names are unique per ID by
+        // construction now, but an index written by an earlier build (or a hand-edited one) may still have two
+        // entries sharing a file — and one of them may be the applied image.
         foreach (CachedImage victim in victims)
         {
+            if (IsFileNamedByIndex(victim.File))
+            {
+                Log.Info($"evict id={victim.Id} file={victim.File} kept=shared");
+                continue;
+            }
+
             DeleteVictimFile(victim);
         }
 
         Save();
         return image;
     }
+
+    private bool IsFileNamedByIndex(string file) =>
+        Index.Images.Any(i => string.Equals(i.File, file, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Records the image currently set on the desktop (single entry in Phase 1) and saves.</summary>
     public void MarkApplied(ImageId id)

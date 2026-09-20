@@ -4,11 +4,18 @@ using BingWallpaperUpdater.Core.Model;
 namespace BingWallpaperUpdater.Core.Cache;
 
 /// <summary>
-/// Cache file naming (CACHE-03): <c>YYYY-MM-DD_&lt;Name&gt;.jpg</c> for UHD, <c>YYYY-MM-DD_&lt;Name&gt;.{w}x{h}.jpg</c>
-/// otherwise, with a total date fallback chain (catalog date, Bing start date, UTC download date).
-/// <c>&lt;Name&gt;</c> is <see cref="ImageId.Name"/> (<c>[A-Za-z0-9]+</c> by construction) and the date prefix is
-/// validated by shape, so no remote text can put a separator into a file name (T-01-02). A final runtime check
-/// rejects anything outside <c>[A-Za-z0-9_.-]</c> or containing <c>..</c> as defence in depth.
+/// Cache file naming (CACHE-03): <c>YYYY-MM-DD_&lt;Name&gt;_&lt;MARKET&gt;&lt;digits&gt;.jpg</c> for UHD,
+/// <c>YYYY-MM-DD_&lt;Name&gt;_&lt;MARKET&gt;&lt;digits&gt;.{w}x{h}.jpg</c> otherwise, with a total date fallback chain
+/// (catalog date, Bing start date, UTC download date). The stem carries the whole <see cref="ImageId"/> — name,
+/// market and numeric suffix — so two distinct IDs can never map to one file (an ID re-issued with a new suffix,
+/// or the same picture under another market after the user edits <c>Settings.Market</c>) and eviction of one
+/// entry can never delete the bytes another entry, possibly the applied one, still points at. Entries written
+/// by earlier builds under the shorter <c>YYYY-MM-DD_&lt;Name&gt;.jpg</c> form stay valid: the index, not the
+/// naming rule, is the truth for which file an entry owns.
+/// <c>&lt;Name&gt;</c> is <see cref="ImageId.Name"/> (<c>[A-Za-z0-9]+</c> by construction), <c>&lt;MARKET&gt;</c> is
+/// <c>[A-Z]{2}-[A-Z]{2}</c>, <c>&lt;digits&gt;</c> is <c>[0-9]+</c>, and the date prefix is validated by shape, so no
+/// remote text can put a separator into a file name (T-01-02). A final runtime check rejects anything outside
+/// <c>[A-Za-z0-9_.-]</c> or containing <c>..</c> as defence in depth.
 /// </summary>
 public static class CacheFileName
 {
@@ -20,16 +27,19 @@ public static class CacheFileName
         ArgumentException.ThrowIfNullOrEmpty(resolution);
 
         string name = entry.Id.Name;
-        if (string.IsNullOrEmpty(name))
+        string market = entry.Id.Market;
+        string digits = entry.Id.Digits;
+        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(market) || string.IsNullOrEmpty(digits))
         {
-            throw new ArgumentException("entry has no parsable image name", nameof(entry));
+            throw new ArgumentException("entry has no parsable image id", nameof(entry));
         }
 
         string prefix = DatePrefix(entry.Date, entry.StartDate, nowUtc);
+        string stem = $"{prefix}_{name}_{market}{digits}";
         string fileName;
         if (string.Equals(resolution, Uhd, StringComparison.OrdinalIgnoreCase))
         {
-            fileName = $"{prefix}_{name}.jpg";
+            fileName = $"{stem}.jpg";
         }
         else
         {
@@ -38,7 +48,7 @@ public static class CacheFileName
                 throw new ArgumentOutOfRangeException(nameof(resolution), resolution, "resolution must be UHD or {w}x{h}");
             }
 
-            fileName = $"{prefix}_{name}.{resolution}.jpg";
+            fileName = $"{stem}.{resolution}.jpg";
         }
 
         if (!IsSafeFileName(fileName))
