@@ -166,7 +166,7 @@ public sealed class CatalogServiceTests : IDisposable
     [InlineData(500)]
     [InlineData(404)]
     [InlineData(503)]
-    public async Task GetCatalog_ReadmeErrorStatus_FallsBackToArchive(int status)
+    public async Task GetCatalog_ReadmeErrorStatus_FallbackToArchive(int status)
     {
         FakeHttpHandler fake = Fake(_ => FakeHttpHandler.Text(status, "nope"), _ => FakeHttpHandler.Json(200, Archive()));
 
@@ -178,7 +178,7 @@ public sealed class CatalogServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GetCatalog_ReadmeWithoutRows_FallsBackToArchive()
+    public async Task GetCatalog_ReadmeWithoutRows_FallbackToArchive()
     {
         FakeHttpHandler fake = Fake(_ => FakeHttpHandler.Text(200, "## Bing Wallpaper\n\nnothing to see\n"), _ => FakeHttpHandler.Json(200, Archive()));
 
@@ -258,7 +258,7 @@ public sealed class CatalogServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GetCatalog_NotModifiedWithoutSavedBody_FallsBackToArchive()
+    public async Task GetCatalog_NotModifiedWithoutSavedBody_FallbackToArchive()
     {
         FakeHttpHandler fake = Fake(_ => FakeHttpHandler.Status(304), _ => FakeHttpHandler.Json(200, Archive()));
         var state = new AppState { CatalogEtag = "\"stale\"" };

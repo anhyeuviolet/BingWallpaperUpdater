@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using BingWallpaperUpdater.Core.Catalog;
 using BingWallpaperUpdater.Core.Model;
 
 namespace BingWallpaperUpdater.Core.Json;
@@ -15,6 +16,7 @@ namespace BingWallpaperUpdater.Core.Json;
 [JsonSerializable(typeof(CacheIndex))]
 [JsonSerializable(typeof(Settings))]
 [JsonSerializable(typeof(AppState))]
+[JsonSerializable(typeof(HpImageArchive))]
 public sealed partial class CoreJsonContext : JsonSerializerContext
 {
 }
