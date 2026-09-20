@@ -19,8 +19,9 @@ public sealed record DownloadResult(bool Ok, string Reason, long Bytes, int Widt
 /// T-01-01, T-01-05, T-01-11). Transport failures and 5xx go through <see cref="RetryPolicy"/> (3 attempts,
 /// jittered 1 s / 3 s backoff, Retry-After) and a request to <c>www.bing.com</c> that still fails is retried
 /// once on <c>cn.bing.com</c> with the identical path (SRC-06). Image bodies are streamed straight to a
-/// <c>.part</c> file under a 64 MB cap and validated (status, length, JPEG SOF dimensions) before the atomic
-/// rename — a UHD JPEG is never held as a byte[] (NFR-03, PITFALLS P1/P12, T-01-03).
+/// <c>.part</c> file under a 64 MB cap, with a per-chunk idle timeout (<see cref="BodyReadTimeout"/>), and
+/// validated (status, length, JPEG SOF dimensions) before the atomic rename — a UHD JPEG is never held as a
+/// byte[] (NFR-03, PITFALLS P1/P12, T-01-03).
 /// </summary>
 public sealed class HttpGateway : IDisposable
 {
@@ -30,6 +31,15 @@ public sealed class HttpGateway : IDisposable
     private const int CopyBufferSize = 1 << 16;
     private readonly HttpClient _client;
     private readonly RetryPolicy _retry;
+
+    /// <summary>
+    /// Longest wait for the next chunk of an image body. <see cref="HttpClient.Timeout"/> stops covering a
+    /// response once <see cref="HttpCompletionOption.ResponseHeadersRead"/> returns, so without this a CDN
+    /// connection that goes half-open after the headers would hold the pipeline, the pooled connection and the
+    /// <c>.part</c> file open forever. The timer restarts on every chunk, so a slow-but-alive transfer is fine.
+    /// Tests shorten it.
+    /// </summary>
+    public TimeSpan BodyReadTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// The only directory tree <see cref="DownloadJpegAsync"/> may write into (defence in depth, T-01-02).
@@ -130,11 +140,18 @@ public sealed class HttpGateway : IDisposable
             byte[] buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
             try
             {
-                await using Stream src = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                // Idle timeout per chunk (WR-02): the linked token fires when no bytes arrive for BodyReadTimeout and
+                // is re-armed after every successful read. A caller cancellation still wins and is told apart below.
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(BodyReadTimeout);
+                CancellationToken readToken = readCts.Token;
+
+                await using Stream src = await response.Content.ReadAsStreamAsync(readToken).ConfigureAwait(false);
                 await using var dst = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, CopyBufferSize, FileOptions.Asynchronous);
                 int n;
-                while ((n = await src.ReadAsync(buffer.AsMemory(0, CopyBufferSize), ct).ConfigureAwait(false)) > 0)
+                while ((n = await src.ReadAsync(buffer.AsMemory(0, CopyBufferSize), readToken).ConfigureAwait(false)) > 0)
                 {
+                    readCts.CancelAfter(BodyReadTimeout);
                     written += n;
                     if (written > MaxBodyBytes)
                     {
@@ -142,10 +159,10 @@ public sealed class HttpGateway : IDisposable
                         break;
                     }
 
-                    await dst.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
+                    await dst.WriteAsync(buffer.AsMemory(0, n), readToken).ConfigureAwait(false);
                 }
 
-                await dst.FlushAsync(ct).ConfigureAwait(false);
+                await dst.FlushAsync(readToken).ConfigureAwait(false);
             }
             finally
             {
@@ -191,8 +208,10 @@ public sealed class HttpGateway : IDisposable
         {
             return Fail($"io failed: {ex.Message}");
         }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
+            // HttpClient.Timeout on the send (TaskCanceledException) or the idle timeout on the body (any
+            // OperationCanceledException from the linked token); the caller's own token is not cancelled.
             return Fail("timeout");
         }
         finally

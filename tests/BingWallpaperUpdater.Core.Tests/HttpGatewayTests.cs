@@ -255,6 +255,55 @@ public sealed class HttpGatewayTests : IDisposable
         AssertNoFilesRemain();
     }
 
+    /// <summary>WR-02: a body that stops arriving after the headers is abandoned after <see cref="HttpGateway.BodyReadTimeout"/>.</summary>
+    [Fact]
+    public async Task Download_BodyStallsAfterHeaders_FailsWithTimeoutInsteadOfHangingAndLeavesNoFiles()
+    {
+        byte[] prefix = JpegBytes.Sof0(3840, 2160)[..12];
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Stream(200, "image/jpeg", FakeHttpHandler.StreamThatStallsAfter(prefix), contentLength: 4_000_000));
+        using HttpGateway gateway = Gateway(fake);
+        gateway.BodyReadTimeout = TimeSpan.FromMilliseconds(200);
+
+        Task<DownloadResult> download = gateway.DownloadJpegAsync(UhdUrl, _finalPath, 3840, 2160, CancellationToken.None);
+        Task finished = await Task.WhenAny(download, Task.Delay(TimeSpan.FromSeconds(10)));
+
+        Assert.Same(download, finished);
+        DownloadResult result = await download;
+        Assert.False(result.Ok);
+        Assert.Equal("timeout", result.Reason);
+        Assert.Single(fake.Requests);
+        AssertNoFilesRemain();
+    }
+
+    /// <summary>The idle timer restarts on every chunk: a slow but live transfer longer than the timeout still succeeds.</summary>
+    [Fact]
+    public async Task Download_SlowButLiveBody_EachChunkInsideTheIdleWindow_Succeeds()
+    {
+        byte[] jpeg = JpegBytes.Sof0(3840, 2160);
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Stream(200, "image/jpeg", FakeHttpHandler.StreamThatTrickles(jpeg, chunk: 8, delay: TimeSpan.FromMilliseconds(60)), contentLength: jpeg.Length));
+        using HttpGateway gateway = Gateway(fake);
+        gateway.BodyReadTimeout = TimeSpan.FromMilliseconds(250);
+
+        DownloadResult result = await gateway.DownloadJpegAsync(UhdUrl, _finalPath, 3840, 2160, CancellationToken.None);
+
+        Assert.True(result.Ok, result.Reason);
+        Assert.Equal(jpeg.Length, result.Bytes);
+    }
+
+    /// <summary>The caller's own cancellation during the body read propagates instead of being reported as a timeout.</summary>
+    [Fact]
+    public async Task Download_CallerCancelsDuringBody_ThrowsOperationCanceledAndLeavesNoFiles()
+    {
+        byte[] prefix = JpegBytes.Sof0(3840, 2160)[..12];
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Stream(200, "image/jpeg", FakeHttpHandler.StreamThatStallsAfter(prefix), contentLength: null));
+        using HttpGateway gateway = Gateway(fake);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => gateway.DownloadJpegAsync(UhdUrl, _finalPath, 3840, 2160, cts.Token));
+
+        AssertNoFilesRemain();
+    }
+
     [Fact]
     public async Task Download_TooLarge_ContentLengthAboveCap_RejectedBeforeReading()
     {

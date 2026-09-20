@@ -131,6 +131,73 @@ public sealed class FakeHttpHandler : HttpMessageHandler
     /// <summary>A stream that yields <paramref name="totalBytes"/> of filler without allocating it.</summary>
     public static Stream EndlessStream(long totalBytes) => new FillerStream(totalBytes);
 
+    /// <summary>
+    /// A stream that serves <paramref name="prefix"/> and then never completes another read — a half-open
+    /// connection. The pending read completes only through the cancellation token the reader passed in.
+    /// </summary>
+    public static Stream StreamThatStallsAfter(byte[] prefix) => new StallingStream(prefix);
+
+    /// <summary>A stream that serves <paramref name="body"/> in <paramref name="chunk"/>-byte pieces, pausing <paramref name="delay"/> before each.</summary>
+    public static Stream StreamThatTrickles(byte[] body, int chunk, TimeSpan delay) => new StallingStream(body, chunk, delay);
+
+    private sealed class StallingStream : Stream
+    {
+        private readonly byte[] _prefix;
+        private readonly int _chunk;
+        private readonly TimeSpan _delay;
+        private int _position;
+
+        public StallingStream(byte[] prefix, int chunk = int.MaxValue, TimeSpan delay = default)
+        {
+            _prefix = prefix;
+            _chunk = chunk;
+            _delay = delay;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => _position; set => throw new NotSupportedException(); }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException("async only");
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_position < _prefix.Length)
+            {
+                if (_delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(_delay, cancellationToken).ConfigureAwait(false);
+                }
+
+                int n = Math.Min(Math.Min(buffer.Length, _chunk), _prefix.Length - _position);
+                _prefix.AsMemory(_position, n).CopyTo(buffer);
+                _position += n;
+                return n;
+            }
+
+            if (_chunk != int.MaxValue)
+            {
+                return 0; // trickling stream: a clean end once the body is served
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+            return 0;
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     private sealed class ThrowingStream : Stream
     {
         private readonly byte[] _prefix;
