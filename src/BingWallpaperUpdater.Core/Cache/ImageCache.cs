@@ -25,9 +25,24 @@ public sealed class ImageCache
         _indexPath = indexPath;
     }
 
+    /// <summary>Cap on validated images in the cache (CACHE-01); <c>.part</c> files never count.</summary>
+    public const int MaxImages = 10;
+
     public CacheIndex Index { get; private set; } = new();
 
     public string CacheDir => _cacheDir;
+
+    /// <summary>
+    /// Startup reconcile (CACHE-05): load the index, drop entries whose file is missing, delete stray
+    /// <c>*.part</c> files, leave every other file alone, and save only when something changed.
+    /// </summary>
+    public void Reconcile() => throw new NotImplementedException();
+
+    /// <summary>
+    /// Appends (replacing any entry with the same id + resolution), evicts down to <see cref="MaxImages"/>
+    /// while protecting the applied and the just-added image, deletes victim files best-effort, saves once.
+    /// </summary>
+    public CachedImage Add(CachedImage image) => throw new NotImplementedException();
 
     /// <summary>Loads <c>index.json</c>; a missing or corrupt index becomes an empty one (never throws).</summary>
     public void Load()
