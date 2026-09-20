@@ -1,0 +1,9 @@
+# Build output
+bin/
+obj/
+publish/
+build.log
+
+# IDE / user state
+*.user
+.vs/

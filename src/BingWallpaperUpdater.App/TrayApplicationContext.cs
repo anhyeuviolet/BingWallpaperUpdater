@@ -1,0 +1,125 @@
+using System.Runtime.Versioning;
+using BingWallpaperUpdater.Core.Cache;
+using BingWallpaperUpdater.Core.Catalog;
+using BingWallpaperUpdater.Core.Diagnostics;
+using BingWallpaperUpdater.Core.Io;
+using BingWallpaperUpdater.Core.Model;
+using BingWallpaperUpdater.Core.Net;
+using BingWallpaperUpdater.Core.Pipeline;
+using BingWallpaperUpdater.Core.Ports;
+using BingWallpaperUpdater.Windows.Wallpaper;
+
+namespace BingWallpaperUpdater.App;
+
+/// <summary>
+/// The tray shell: one <see cref="NotifyIcon"/> with an Exit item, no window ever. The launch-time pipeline
+/// runs on the thread pool and only the COM apply hops back to this (STA) thread via the captured
+/// <see cref="SynchronizationContext"/>. <see cref="Dispose(bool)"/> is idempotent because WinForms disposes
+/// the context again when the message loop ends (RESEARCH Pitfall 4).
+/// </summary>
+[SupportedOSPlatform("windows8.0")]
+internal sealed class TrayApplicationContext : ApplicationContext
+{
+    private readonly NotifyIcon _icon;
+    private readonly CancellationTokenSource _cts = new();
+    private bool _disposed;
+
+    public TrayApplicationContext()
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Exit", null, (_, _) => Shutdown());
+
+        _icon = new NotifyIcon
+        {
+            Icon = LoadTrayIcon(),
+            Text = "Bing Wallpaper Updater",
+            ContextMenuStrip = menu,
+            Visible = true,
+        };
+
+        SynchronizationContext ui = SynchronizationContext.Current
+            ?? throw new InvalidOperationException("no WinForms synchronization context on the UI thread");
+
+        _ = Task.Run(() => RunPipelineAsync(ui, _cts.Token));
+    }
+
+    private static async Task RunPipelineAsync(SynchronizationContext ui, CancellationToken ct)
+    {
+        try
+        {
+            using var http = new HttpGateway();
+            var settings = new Settings();
+            var state = new AppState();
+            var cache = new ImageCache(AppPaths.CacheDir, AppPaths.IndexPath);
+            cache.Load();
+            var catalog = new CatalogService(http, state, AppPaths.CatalogBodyPath);
+
+            (string AbsolutePath, ImageId Id)? result =
+                await FirstRunPipeline.EnsureTodayAsync(settings, state, catalog, cache, http, ct).ConfigureAwait(false);
+            if (result is null)
+            {
+                return; // already logged; the desktop is left untouched
+            }
+
+            ui.Post(_ => ApplyOnUiThread(result.Value.AbsolutePath, result.Value.Id, cache, state), null);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"pipeline failed stage=download error={ex.Message}", ex);
+        }
+    }
+
+    private static void ApplyOnUiThread(string absolutePath, ImageId id, ImageCache cache, AppState state)
+    {
+        try
+        {
+            IWallpaperApplier applier = new DesktopWallpaperApplier();
+            ApplyResult apply = applier.Apply(absolutePath);
+            if (!apply.Ok)
+            {
+                Log.Warn($"apply failed method={apply.Method} error={apply.Error}");
+                return;
+            }
+
+            Log.Info($"apply ok method={apply.Method} id={id} path={absolutePath} readback={apply.ReadBackPath ?? "-"} position={apply.Position ?? "-"}");
+            cache.MarkApplied(id);
+            state.CurrentImageId = id.Value;
+            state.LastAppliedUtc = DateTimeOffset.UtcNow;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"pipeline failed stage=apply error={ex.Message}", ex);
+        }
+    }
+
+    private static Icon LoadTrayIcon()
+    {
+        using Stream? stream = typeof(TrayApplicationContext).Assembly.GetManifestResourceStream("tray.ico");
+        return stream is null
+            ? SystemIcons.Application
+            : new Icon(stream, SystemInformation.SmallIconSize);
+    }
+
+    private void Shutdown()
+    {
+        Dispose();
+        ExitThread();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
+            _cts.Cancel();
+            _icon.Visible = false;
+            _icon.Dispose();
+            _cts.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+}

@@ -1,0 +1,24 @@
+<Project>
+
+  <!--
+    Shared, harmless build knobs for every project in the solution.
+    Publish identity (runtime identifier, self-contained, single-file) lives ONLY in
+    src/BingWallpaperUpdater.App/BingWallpaperUpdater.App.csproj - putting it here breaks the
+    test project with NETSDK1191 (RESEARCH Pitfall 2). The resource-key stripping switch is
+    deliberately absent: it strips exception messages at runtime (RESEARCH Pitfall 3).
+  -->
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <TieredPGO>false</TieredPGO>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <SatelliteResourceLanguages>en;vi</SatelliteResourceLanguages>
+    <Version>0.1.0</Version>
+    <!-- Filled in Phase 4 once the public repository exists; consumed by the HTTP User-Agent. -->
+    <RepositoryUrl></RepositoryUrl>
+  </PropertyGroup>
+
+</Project>

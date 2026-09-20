@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <RootNamespace>BingWallpaperUpdater.App</RootNamespace>
+    <AssemblyName>BingWallpaperUpdater</AssemblyName>
+    <!-- Publish identity lives here only (never in Directory.Build.props — NETSDK1191 on the test project). -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <ApplicationIcon>Resources/tray.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources/tray.ico" LogicalName="tray.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BingWallpaperUpdater.Core\BingWallpaperUpdater.Core.csproj" />
+    <ProjectReference Include="..\BingWallpaperUpdater.Windows\BingWallpaperUpdater.Windows.csproj" />
+  </ItemGroup>
+
+</Project>
