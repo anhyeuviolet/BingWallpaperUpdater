@@ -3,8 +3,9 @@ namespace BingWallpaperUpdater.Core.Scheduling;
 /// <summary>
 /// Pure due-time arithmetic for the scheduler (ROT-04, ROT-06; D-06, D-07, D-13). No I/O, no logging, no clock:
 /// every method takes <c>now</c> from the caller, which reads it from the injected <see cref="TimeProvider"/> — never
-/// from <c>DateTime.Now</c>, a tick counter or a stopwatch (CLAUDE.md "What NOT to Use"). <c>RotationService</c>
-/// applies these rules; the tables in <c>ScheduleMathTests</c> prove them under sleep gaps, backward jumps and DST.
+/// from the local wall clock, an uptime counter or an elapsed-time measurement (CLAUDE.md "What NOT to Use").
+/// <c>RotationService</c> applies these rules; the tables in <c>ScheduleMathTests</c> prove them under sleep gaps,
+/// backward jumps and DST.
 /// </summary>
 public static class ScheduleMath
 {
