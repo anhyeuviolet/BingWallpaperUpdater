@@ -1,4 +1,5 @@
 using BingWallpaperUpdater.Core.Cache;
+using BingWallpaperUpdater.Core.Catalog;
 using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Io;
 using BingWallpaperUpdater.Core.Json;
@@ -152,6 +153,67 @@ public sealed class ImageCacheEnsureTests : IDisposable
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => cache.EnsureAsync(Entry("OHR.SomethingElse_EN-US1"), "UHD", _http, CancellationToken.None));
+    }
+
+    // ---- single owner of failover (WR-05) ----------------------------------------------------------------
+
+    /// <summary>A gateway over <paramref name="fake"/> whose retry policy records delays instead of sleeping.</summary>
+    private HttpGateway ScriptedGateway(FakeHttpHandler fake) =>
+        new(fake, retry: new RetryPolicy(delay: (_, _) => Task.CompletedTask, random: new Random(20260920))) { DownloadRoot = _dir };
+
+    [Fact]
+    public async Task Ensure_WwwDownOnEveryAttempt_CnServes_ExactlyOneGatewayPolicyRunPerHost()
+    {
+        var fake = new FakeHttpHandler()
+            .Map(BingImageUrl.PrimaryHost, "/", FakeHttpHandler.Throw(new HttpRequestException("www down")))
+            .Map(BingImageUrl.RetryHost, "/", _ => FakeHttpHandler.Bytes(200, "image/jpeg", JpegBytes.Sof0(3840, 2160)));
+        using HttpGateway http = ScriptedGateway(fake);
+        var cache = new ImageCache(_dir, _indexPath);
+        cache.Load();
+
+        CachedImage? cached = await cache.EnsureAsync(Entry(), "UHD", http, CancellationToken.None);
+
+        Assert.NotNull(cached);
+        Assert.Equal(3, fake.RequestsTo(BingImageUrl.PrimaryHost).Count());
+        Assert.Single(fake.RequestsTo(BingImageUrl.RetryHost));
+        Assert.Equal(4, fake.Requests.Count); // not 3 (www) + 3 (cn) + 3 (cn again)
+        Assert.True(File.Exists(Path.Combine(_dir, cached!.File)));
+        Assert.Single(cache.Index.Images);
+    }
+
+    [Fact]
+    public async Task Ensure_BothHostsDown_ReturnsNullAfterOneRunPerHost_NothingIndexed()
+    {
+        var fake = new FakeHttpHandler(FakeHttpHandler.Throw(new HttpRequestException("bing down")));
+        using HttpGateway http = ScriptedGateway(fake);
+        var cache = new ImageCache(_dir, _indexPath);
+        cache.Load();
+
+        CachedImage? cached = await cache.EnsureAsync(Entry(), "UHD", http, CancellationToken.None);
+
+        Assert.Null(cached);
+        Assert.Equal(3, fake.RequestsTo(BingImageUrl.PrimaryHost).Count());
+        Assert.Equal(3, fake.RequestsTo(BingImageUrl.RetryHost).Count());
+        Assert.Equal(6, fake.Requests.Count);
+        Assert.Empty(cache.Index.Images);
+        Assert.Contains("download rejected host=www.bing.com reason=request failed", LogText());
+        Assert.Empty(Directory.GetFiles(_dir, "*.jpg*"));
+    }
+
+    [Fact]
+    public async Task Ensure_Www404_ReturnsNullAfterASingleRequest_NoMirrorAttempt()
+    {
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Bytes(404, "image/jpeg", new byte[] { 0xFF, 0xD8 }));
+        using HttpGateway http = ScriptedGateway(fake);
+        var cache = new ImageCache(_dir, _indexPath);
+        cache.Load();
+
+        CachedImage? cached = await cache.EnsureAsync(Entry(), "UHD", http, CancellationToken.None);
+
+        Assert.Null(cached);
+        RecordedRequest only = Assert.Single(fake.Requests);
+        Assert.Equal(BingImageUrl.PrimaryHost, only.Uri.Host);
+        Assert.Contains("download rejected host=www.bing.com reason=status 404", LogText());
     }
 
     [Fact]

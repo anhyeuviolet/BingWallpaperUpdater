@@ -92,8 +92,10 @@ public sealed class ImageCache
 
     /// <summary>
     /// Returns the cached entry for <c>(id, resolution)</c> without any network call when it exists and its file is
-    /// present (SRC-09); otherwise downloads it — primary host, then one retry on the mirror — and records it via
-    /// <see cref="Add"/>. Returns null when both attempts are rejected; nothing is written to the index in that case.
+    /// present (SRC-09); otherwise downloads it from <see cref="BingImageUrl.PrimaryHost"/> and records it via
+    /// <see cref="Add"/>. Retries and the single www→cn failover are owned by <see cref="HttpGateway"/> (SRC-06);
+    /// this method issues exactly one download so a Bing outage costs one policy run per host, not three. Returns
+    /// null when the download is rejected; nothing is written to the index in that case.
     /// </summary>
     public async Task<CachedImage?> EnsureAsync(CatalogEntry entry, string resolution, HttpGateway http, CancellationToken ct)
     {
@@ -112,43 +114,38 @@ public sealed class ImageCache
         (int minW, int minH) = BingImageUrl.MinDimensions(resolution);
         bool isUhd = string.Equals(resolution, "UHD", StringComparison.Ordinal);
 
-        foreach (string host in new[] { BingImageUrl.PrimaryHost, BingImageUrl.RetryHost })
+        Uri url = isUhd
+            ? BingImageUrl.Image(BingImageUrl.PrimaryHost, entry.Id, null, null)
+            : BingImageUrl.Image(BingImageUrl.PrimaryHost, entry.Id, minW, minH);
+
+        DownloadResult result = await http.DownloadJpegAsync(url, finalPath, minW, minH, ct).ConfigureAwait(false);
+        if (!result.Ok)
         {
-            Uri url = isUhd
-                ? BingImageUrl.Image(host, entry.Id, null, null)
-                : BingImageUrl.Image(host, entry.Id, minW, minH);
-
-            DownloadResult result = await http.DownloadJpegAsync(url, finalPath, minW, minH, ct).ConfigureAwait(false);
-            if (!result.Ok)
-            {
-                Log.Info($"download rejected host={host} reason={result.Reason}");
-                continue;
-            }
-
-            var cached = new CachedImage
-            {
-                Id = entry.Id.Value,
-                Market = entry.Id.Market,
-                Date = entry.Date,
-                StartDate = entry.StartDate,
-                Title = entry.Title,
-                Copyright = entry.Copyright,
-                CopyrightLink = entry.CopyrightLink,
-                Resolution = resolution,
-                Width = result.Width,
-                Height = result.Height,
-                File = fileName,
-                Bytes = result.Bytes,
-                SourceUrl = url.ToString(),
-                DownloadedUtc = DateTimeOffset.UtcNow,
-            };
-
-            Add(cached);
-            Log.Info($"cache add id={cached.Id} file={cached.File} bytes={cached.Bytes} dims={cached.Width}x{cached.Height}");
-            return cached;
+            Log.Info($"download rejected host={url.Host} reason={result.Reason}");
+            return null;
         }
 
-        return null;
+        var cached = new CachedImage
+        {
+            Id = entry.Id.Value,
+            Market = entry.Id.Market,
+            Date = entry.Date,
+            StartDate = entry.StartDate,
+            Title = entry.Title,
+            Copyright = entry.Copyright,
+            CopyrightLink = entry.CopyrightLink,
+            Resolution = resolution,
+            Width = result.Width,
+            Height = result.Height,
+            File = fileName,
+            Bytes = result.Bytes,
+            SourceUrl = url.ToString(),
+            DownloadedUtc = DateTimeOffset.UtcNow,
+        };
+
+        Add(cached);
+        Log.Info($"cache add id={cached.Id} file={cached.File} bytes={cached.Bytes} dims={cached.Width}x{cached.Height}");
+        return cached;
     }
 
     /// <summary>
