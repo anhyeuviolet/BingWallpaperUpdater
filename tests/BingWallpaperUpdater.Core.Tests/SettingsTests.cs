@@ -93,15 +93,91 @@ public sealed class SettingsTests : IDisposable
         Assert.Null(ex);
     }
 
+    [Theory]
+    [InlineData(30, 30, false)]
+    [InlineData(60, 60, false)]
+    [InlineData(120, 120, false)]
+    [InlineData(240, 240, false)]
+    [InlineData(480, 480, false)]
+    [InlineData(1440, 1440, false)]
+    [InlineData(29, 30, true)]
+    [InlineData(31, 30, true)]
+    [InlineData(45, 30, true)]
+    [InlineData(1441, 30, true)]
+    [InlineData(0, 30, true)]
+    [InlineData(-30, 30, true)]
+    public void Sanitize_IntervalMinutes_AllowListedValuesKept_OthersBecome30(int input, int expected, bool expectChanged)
+    {
+        var settings = new Settings { IntervalMinutes = input };
+
+        bool changed = settings.Sanitize();
+
+        Assert.Equal(expected, settings.IntervalMinutes);
+        Assert.Equal(TimeSpan.FromMinutes(expected), settings.Interval);
+        Assert.Equal(expectChanged, changed);
+    }
+
+    [Theory]
+    [InlineData("newest", "newest", false)]
+    [InlineData("random", "random", false)]
+    [InlineData("RANDOM", "random", true)]
+    [InlineData(" Newest ", "newest", true)]
+    [InlineData("weekly", "newest", true)]
+    [InlineData("", "newest", true)]
+    [InlineData(null, "newest", true)]
+    public void Sanitize_Mode_CaseInsensitiveCanonical_UnknownBecomesNewest(string? input, string expected, bool expectChanged)
+    {
+        var settings = new Settings { Mode = input! };
+
+        bool changed = settings.Sanitize();
+
+        Assert.Equal(expected, settings.Mode);
+        Assert.Equal(expected == Settings.RandomMode, settings.IsRandomMode);
+        Assert.Equal(expectChanged, changed);
+    }
+
     [Fact]
     public void Sanitize_InvalidValues_AreLoggedWithTheOffendingValueEscaped()
     {
-        var settings = new Settings { Market = "en-US&idx=7", Resolution = "4K\u0007" };
+        var settings = new Settings { Market = "en-US&idx=7", Resolution = "4K\u0007", IntervalMinutes = 45, Mode = "weekly" };
 
         settings.Sanitize();
 
         Assert.Contains("settings invalid field=Market value='en-US&idx=7' using=en-US", LogText());
         Assert.Contains("settings invalid field=Resolution value='4K\\u0007' using=UHD", LogText());
+        Assert.Contains("settings invalid field=IntervalMinutes value=45 using=30", LogText());
+        Assert.Contains("settings invalid field=Mode value='weekly' using=newest", LogText());
+    }
+
+    [Fact]
+    public void LoadOrCreate_Phase1File_WithoutIntervalOrMode_LoadsDefaults()
+    {
+        string path = Path.Combine(_dir, "settings.json");
+        const string body = """{ "schemaVersion": 1, "market": "en-US", "resolution": "UHD" }""";
+        File.WriteAllText(path, body);
+
+        Settings settings = Settings.LoadOrCreate(path);
+
+        Assert.Equal(30, settings.IntervalMinutes);
+        Assert.Equal("newest", settings.Mode);
+        Assert.False(settings.IsRandomMode);
+        Assert.Equal(body, File.ReadAllText(path));   // a loaded file is never rewritten (T-01-08)
+        Assert.DoesNotContain("settings invalid", LogText());
+    }
+
+    [Fact]
+    public void Save_DoesNotWriteComputedProperties()
+    {
+        string path = Path.Combine(_dir, "settings.json");
+        var settings = new Settings();
+
+        settings.Save(path);
+        string text = File.ReadAllText(path);
+
+        Assert.Contains("\"intervalMinutes\": 30", text);
+        Assert.Contains("\"mode\": \"newest\"", text);
+        Assert.DoesNotContain("\"interval\"", text);
+        Assert.DoesNotContain("isRandomMode", text);
     }
 
     [Fact]
