@@ -1,4 +1,3 @@
-using System.Globalization;
 using BingWallpaperUpdater.Core.Catalog;
 using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Io;
@@ -10,7 +9,10 @@ namespace BingWallpaperUpdater.Core.Cache;
 
 /// <summary>
 /// The per-user image cache: <c>cache\index.json</c> plus <c>YYYY-MM-DD_&lt;Name&gt;.jpg</c> files.
-/// The index is the truth — only images listed here are ever applied. Eviction and reconcile arrive in Plan 03.
+/// The index is the truth — only images listed here are ever applied. This class owns every delete the app
+/// performs: eviction removes only files named in the index, reconcile removes only <c>*.part</c> files inside
+/// the cache directory, and unknown files are never touched (T-01-15). The applied image is never evicted
+/// (CACHE-02; CLAUDE.md "Deleting the wallpaper file after setting it").
 /// </summary>
 public sealed class ImageCache
 {
@@ -32,18 +34,6 @@ public sealed class ImageCache
 
     public string CacheDir => _cacheDir;
 
-    /// <summary>
-    /// Startup reconcile (CACHE-05): load the index, drop entries whose file is missing, delete stray
-    /// <c>*.part</c> files, leave every other file alone, and save only when something changed.
-    /// </summary>
-    public void Reconcile() => throw new NotImplementedException();
-
-    /// <summary>
-    /// Appends (replacing any entry with the same id + resolution), evicts down to <see cref="MaxImages"/>
-    /// while protecting the applied and the just-added image, deletes victim files best-effort, saves once.
-    /// </summary>
-    public CachedImage Add(CachedImage image) => throw new NotImplementedException();
-
     /// <summary>Loads <c>index.json</c>; a missing or corrupt index becomes an empty one (never throws).</summary>
     public void Load()
     {
@@ -52,38 +42,55 @@ public sealed class ImageCache
         Index.Images ??= [];
     }
 
+    /// <summary>
+    /// Startup reconcile (CACHE-05): load the index, drop entries whose file is missing, delete stray
+    /// <c>*.part</c> files, leave every other file alone, and save only when something changed.
+    /// Runs before any network call; a hand-edited folder or corrupt index never throws.
+    /// </summary>
+    public void Reconcile()
+    {
+        Load();
+
+        IEnumerable<string> names = Directory.Exists(_cacheDir)
+            ? Directory.EnumerateFiles(_cacheDir).Select(f => Path.GetFileName(f))
+            : [];
+
+        int appliedBefore = Index.Applied.Count;
+        ReconcileResult result = CacheReconciler.Reconcile(Index, names);
+
+        int parts = 0;
+        foreach (string part in result.PartFiles)
+        {
+            if (TryDeleteOwnedFile(part))
+            {
+                parts++;
+            }
+        }
+
+        Index = result.Index;
+        Log.Info($"reconcile dropped={result.DroppedIds.Count} parts={parts}");
+
+        if (result.DroppedIds.Count > 0 || parts > 0 || Index.Applied.Count != appliedBefore)
+        {
+            Save();
+        }
+    }
+
     public CachedImage? TryGet(ImageId id, string resolution) =>
         Index.Images.FirstOrDefault(i =>
             string.Equals(i.Id, id.Value, StringComparison.Ordinal)
             && string.Equals(i.Resolution, resolution, StringComparison.Ordinal));
 
     /// <summary>
-    /// <c>{date}_{Name}.jpg</c> for UHD, <c>{date}_{Name}.{w}x{h}.jpg</c> otherwise. The date is the catalog
-    /// date, else Bing's start date reformatted, else today (UTC). Both segments are regex-constrained
-    /// (<c>\d{4}-\d{2}-\d{2}</c>, <c>[A-Za-z0-9]+</c>) so remote text cannot inject path characters (T-01-02).
+    /// <c>{date}_{Name}.jpg</c> for UHD, <c>{date}_{Name}.{w}x{h}.jpg</c> otherwise (see <see cref="CacheFileName"/>).
     /// </summary>
-    public string FileNameFor(CatalogEntry entry, string resolution, DateTimeOffset nowUtc)
-    {
-        ArgumentNullException.ThrowIfNull(entry);
-        string date = ResolveDate(entry, nowUtc);
-        string name = entry.Id.Name;
-        if (string.IsNullOrEmpty(name))
-        {
-            throw new ArgumentException("entry has no parsable image name", nameof(entry));
-        }
-
-        if (string.Equals(resolution, "UHD", StringComparison.Ordinal))
-        {
-            return $"{date}_{name}.jpg";
-        }
-
-        (int w, int h) = BingImageUrl.MinDimensions(resolution);
-        return string.Create(CultureInfo.InvariantCulture, $"{date}_{name}.{w}x{h}.jpg");
-    }
+    public string FileNameFor(CatalogEntry entry, string resolution, DateTimeOffset nowUtc) =>
+        CacheFileName.For(entry, resolution, nowUtc);
 
     /// <summary>
-    /// Returns the cached entry, downloading it first when absent: primary host, then one retry on the
-    /// mirror. Returns null when both attempts are rejected; nothing is written to the index in that case.
+    /// Returns the cached entry for <c>(id, resolution)</c> without any network call when it exists and its file is
+    /// present (SRC-09); otherwise downloads it — primary host, then one retry on the mirror — and records it via
+    /// <see cref="Add"/>. Returns null when both attempts are rejected; nothing is written to the index in that case.
     /// </summary>
     public async Task<CachedImage?> EnsureAsync(CatalogEntry entry, string resolution, HttpGateway http, CancellationToken ct)
     {
@@ -133,16 +140,56 @@ public sealed class ImageCache
                 DownloadedUtc = DateTimeOffset.UtcNow,
             };
 
-            Index.Images.RemoveAll(i =>
-                string.Equals(i.Id, cached.Id, StringComparison.Ordinal)
-                && string.Equals(i.Resolution, resolution, StringComparison.Ordinal));
-            Index.Images.Add(cached);
-            Save();
+            Add(cached);
             Log.Info($"cache add id={cached.Id} file={cached.File} bytes={cached.Bytes} dims={cached.Width}x{cached.Height}");
             return cached;
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Appends <paramref name="image"/> (replacing any entry with the same id + resolution), evicts down to
+    /// <see cref="MaxImages"/> with <c>Applied ∪ {image.Id}</c> protected, deletes each victim's file best-effort,
+    /// logs <c>evict id= file=</c> per victim, and saves the index exactly once at the end.
+    /// </summary>
+    public CachedImage Add(CachedImage image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+
+        List<CachedImage> replaced = Index.Images.FindAll(i =>
+            string.Equals(i.Id, image.Id, StringComparison.Ordinal)
+            && string.Equals(i.Resolution, image.Resolution, StringComparison.Ordinal));
+        Index.Images.RemoveAll(replaced.Contains);
+        Index.Images.Add(image);
+
+        var protectedIds = new HashSet<string>(Index.Applied, StringComparer.Ordinal) { image.Id };
+        IReadOnlyList<CachedImage> victims = EvictionPolicy.SelectVictims(Index.Images, protectedIds, MaxImages);
+        foreach (CachedImage victim in victims)
+        {
+            Index.Images.Remove(victim);
+        }
+
+        // A stale file left by a replaced entry (different date prefix, same id + resolution) is owned by the index
+        // and is deleted like a victim — unless the id is applied, in which case the file on the desktop stays.
+        foreach (CachedImage old in replaced)
+        {
+            bool sameFile = string.Equals(old.File, image.File, StringComparison.OrdinalIgnoreCase);
+            bool applied = Index.Applied.Contains(old.Id, StringComparer.Ordinal);
+            bool stillReferenced = Index.Images.Any(i => string.Equals(i.File, old.File, StringComparison.OrdinalIgnoreCase));
+            if (!sameFile && !applied && !stillReferenced)
+            {
+                DeleteVictimFile(old);
+            }
+        }
+
+        foreach (CachedImage victim in victims)
+        {
+            DeleteVictimFile(victim);
+        }
+
+        Save();
+        return image;
     }
 
     /// <summary>Records the image currently set on the desktop (single entry in Phase 1) and saves.</summary>
@@ -154,20 +201,44 @@ public sealed class ImageCache
 
     public void Save() => AtomicJsonFile.Save(_indexPath, Index, CoreJsonContext.Default.CacheIndex);
 
-    private static string ResolveDate(CatalogEntry entry, DateTimeOffset nowUtc)
+    private void DeleteVictimFile(CachedImage victim)
     {
-        if (!string.IsNullOrEmpty(entry.Date)
-            && DateTime.TryParseExact(entry.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime d))
+        Log.Info($"evict id={victim.Id} file={victim.File}");
+        TryDeleteOwnedFile(victim.File);
+    }
+
+    /// <summary>
+    /// Deletes a file by bare name inside the cache directory, best-effort. Refuses anything that is not a bare
+    /// name (a hand-edited index cannot make the app delete outside its own directory).
+    /// </summary>
+    private bool TryDeleteOwnedFile(string fileName)
+    {
+        if (!CacheReconciler.IsBareFileName(fileName))
         {
-            return d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            Log.Warn($"delete refused name={fileName}");
+            return false;
         }
 
-        if (!string.IsNullOrEmpty(entry.StartDate)
-            && DateTime.TryParseExact(entry.StartDate, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime s))
+        string path = Path.Combine(_cacheDir, fileName);
+        try
         {
-            return s.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        }
+            if (!File.Exists(path))
+            {
+                return false;
+            }
 
-        return nowUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            File.Delete(path);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            Log.Warn($"delete failed file={fileName}", ex);
+            return false;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Log.Warn($"delete failed file={fileName}", ex);
+            return false;
+        }
     }
 }

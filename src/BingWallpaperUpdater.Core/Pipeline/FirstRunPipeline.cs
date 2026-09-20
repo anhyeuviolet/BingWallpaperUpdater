@@ -26,6 +26,9 @@ public static class FirstRunPipeline
         ArgumentNullException.ThrowIfNull(cache);
         ArgumentNullException.ThrowIfNull(http);
 
+        // CACHE-05: reconcile the cache directory before any network call (drops missing files, deletes *.part).
+        cache.Reconcile();
+
         CatalogEntry? entry = await catalog.GetNewestAsync(settings.Market, ct).ConfigureAwait(false);
         if (entry is null)
         {
