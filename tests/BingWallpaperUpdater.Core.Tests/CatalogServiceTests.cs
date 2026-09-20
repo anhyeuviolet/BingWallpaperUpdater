@@ -54,8 +54,11 @@ public sealed class CatalogServiceTests : IDisposable
 
     private string LogText() => File.Exists(_logPath) ? File.ReadAllText(_logPath) : string.Empty;
 
+    /// <summary>Retries still happen (the fake sees every attempt) but nothing sleeps: these tests are about source selection, not timing.</summary>
+    private static RetryPolicy NoDelay() => new(delay: (_, _) => Task.CompletedTask, random: new Random(1));
+
     private CatalogService Service(FakeHttpHandler fake, AppState? state = null, Uri? readmeOverride = null) =>
-        new(new HttpGateway(fake), state ?? new AppState(), _catalogPath, readmeOverride);
+        new(new HttpGateway(fake, retry: NoDelay()), state ?? new AppState(), _catalogPath, readmeOverride);
 
     private static FakeHttpHandler Fake(Func<HttpRequestMessage, HttpResponseMessage>? github, Func<HttpRequestMessage, HttpResponseMessage>? archive)
     {
@@ -67,7 +70,9 @@ public sealed class CatalogServiceTests : IDisposable
 
         if (archive is not null)
         {
+            // The gateway fails over www -> cn on transport errors / 5xx, so the archive responder answers on both.
             fake.Map(BingHost, ArchivePath, archive);
+            fake.Map(BingImageUrl.RetryHost, ArchivePath, archive);
         }
 
         return fake;
