@@ -13,6 +13,8 @@ namespace BingWallpaperUpdater.Core.Json;
     PropertyNameCaseInsensitive = true,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(CacheIndex))]
+[JsonSerializable(typeof(Settings))]
+[JsonSerializable(typeof(AppState))]
 public sealed partial class CoreJsonContext : JsonSerializerContext
 {
 }

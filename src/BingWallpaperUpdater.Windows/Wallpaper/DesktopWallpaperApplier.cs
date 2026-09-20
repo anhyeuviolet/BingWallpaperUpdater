@@ -14,6 +14,8 @@ namespace BingWallpaperUpdater.Windows.Wallpaper;
 /// back with <c>GetWallpaper(NULL)</c>/<c>GetPosition</c> and a mismatch is logged, never thrown (PITFALLS P4).
 /// Call on the WinForms UI thread; the COM proxy is created per apply and simply dropped afterwards
 /// (source-generated <c>ComObject</c> RCWs must not go through the Marshal release helpers).
+/// When activation itself throws, the call degrades to <see cref="SpiWallpaperFallback"/>; a failure
+/// after a successful activation (bad path, shell error) is reported as-is without falling back.
 /// Phase 1 deliberately has no per-monitor enumeration.
 /// </summary>
 [SupportedOSPlatform("windows8.0")]
@@ -35,7 +37,9 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
         }
         catch (COMException ex)
         {
-            return new ApplyResult(false, MethodName, null, null, $"activation failed: 0x{ex.HResult:X8} {ex.Message}");
+            // Activation failure only (no IDesktopWallpaper on this session): degrade to the legacy SPI path.
+            Log.Warn($"apply failed method={MethodName} error=activation failed 0x{ex.HResult:X8} {ex.Message}");
+            return SpiWallpaperFallback.Apply(absolutePath);
         }
 
         try

@@ -8,26 +8,31 @@ using BingWallpaperUpdater.Core.Net;
 using BingWallpaperUpdater.Core.Pipeline;
 using BingWallpaperUpdater.Core.Ports;
 using BingWallpaperUpdater.Windows.Wallpaper;
+using Microsoft.Win32;
 
 namespace BingWallpaperUpdater.App;
 
 /// <summary>
 /// The tray shell: one <see cref="NotifyIcon"/> with an Exit item, no window ever. The launch-time pipeline
 /// runs on the thread pool and only the COM apply hops back to this (STA) thread via the captured
-/// <see cref="SynchronizationContext"/>. <see cref="Dispose(bool)"/> is idempotent because WinForms disposes
-/// the context again when the message loop ends (RESEARCH Pitfall 4).
+/// <see cref="SynchronizationContext"/>. Every exit path (Exit menu, thread/unhandled exception, session
+/// ending) funnels through <see cref="Shutdown"/>, which logs once, hides and disposes the icon, then ends
+/// the message loop. <see cref="Dispose(bool)"/> is idempotent because WinForms disposes the context again
+/// when the loop ends (RESEARCH Pitfall 4).
 /// </summary>
 [SupportedOSPlatform("windows8.0")]
 internal sealed class TrayApplicationContext : ApplicationContext
 {
     private readonly NotifyIcon _icon;
     private readonly CancellationTokenSource _cts = new();
+    private readonly SessionEndingEventHandler _sessionEnding;
+    private int _shutdownRequested;
     private bool _disposed;
 
     public TrayApplicationContext()
     {
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Exit", null, (_, _) => Shutdown());
+        menu.Items.Add("Exit", null, (_, _) => Shutdown("exit"));
 
         _icon = new NotifyIcon
         {
@@ -36,6 +41,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true,
         };
+
+        _sessionEnding = (_, _) => Shutdown("session-ending");
+        SystemEvents.SessionEnding += _sessionEnding;
 
         SynchronizationContext ui = SynchronizationContext.Current
             ?? throw new InvalidOperationException("no WinForms synchronization context on the UI thread");
@@ -48,14 +56,18 @@ internal sealed class TrayApplicationContext : ApplicationContext
         try
         {
             using var http = new HttpGateway();
-            var settings = new Settings();
-            var state = new AppState();
+            Settings settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
+            AppState state = AppState.LoadOrCreate(AppPaths.StatePath);
             var cache = new ImageCache(AppPaths.CacheDir, AppPaths.IndexPath);
             cache.Load();
             var catalog = new CatalogService(http, state, AppPaths.CatalogBodyPath);
 
             (string AbsolutePath, ImageId Id)? result =
                 await FirstRunPipeline.EnsureTodayAsync(settings, state, catalog, cache, http, ct).ConfigureAwait(false);
+
+            // Persist the catalog ETag/fetch time whether or not a download followed.
+            state.Save(AppPaths.StatePath);
+
             if (result is null)
             {
                 return; // already logged; the desktop is left untouched
@@ -88,6 +100,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             cache.MarkApplied(id);
             state.CurrentImageId = id.Value;
             state.LastAppliedUtc = DateTimeOffset.UtcNow;
+            state.Save(AppPaths.StatePath);
         }
         catch (Exception ex)
         {
@@ -103,8 +116,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
             : new Icon(stream, SystemInformation.SmallIconSize);
     }
 
-    private void Shutdown()
+    /// <summary>The single exit path. Safe to call more than once and from any route.</summary>
+    public void Shutdown(string reason)
     {
+        if (Interlocked.Exchange(ref _shutdownRequested, 1) != 0)
+        {
+            return;
+        }
+
+        Log.Info($"shutdown reason={reason}");
         Dispose();
         ExitThread();
     }
@@ -114,6 +134,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (disposing && !_disposed)
         {
             _disposed = true;
+            SystemEvents.SessionEnding -= _sessionEnding;
             _cts.Cancel();
             _icon.Visible = false;
             _icon.Dispose();

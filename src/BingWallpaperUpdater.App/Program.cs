@@ -18,7 +18,7 @@ internal static class Program
     {
         // A second launch must exit immediately: no log line, no network, no cache access (SRC-09).
         using var mutex = new Mutex(initiallyOwned: true, MutexName, out bool createdNew);
-        if (!createdNew)
+        if (!createdNew && !TryAcquireExisting(mutex))
         {
             return 0;
         }
@@ -27,9 +27,41 @@ internal static class Program
         Log.Initialize(AppPaths.LogPath);
 
         ApplicationConfiguration.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
+        TrayApplicationContext? context = null;
+        Application.ThreadException += (_, e) =>
+        {
+            Log.Warn("unhandled", e.Exception);
+            context?.Shutdown("unhandled");
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            Log.Warn("unhandled", e.ExceptionObject as Exception);
+            context?.Shutdown("unhandled");
+        };
+
         Log.Info($"startup version={InformationalVersion()} pid={Environment.ProcessId}");
-        Application.Run(new TrayApplicationContext());
+        context = new TrayApplicationContext();
+        Application.Run(context);
         return 0;
+    }
+
+    /// <summary>
+    /// The mutex already existed. If its previous owner died without releasing it, the wait surfaces an
+    /// <see cref="AbandonedMutexException"/> — which means acquisition SUCCEEDED (PITFALLS P10), so a crash
+    /// never blocks the next start. A live owner makes the zero-timeout wait return false.
+    /// </summary>
+    private static bool TryAcquireExisting(Mutex mutex)
+    {
+        try
+        {
+            return mutex.WaitOne(TimeSpan.Zero);
+        }
+        catch (AbandonedMutexException)
+        {
+            return true;
+        }
     }
 
     private static string InformationalVersion()

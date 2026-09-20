@@ -1,3 +1,6 @@
+using BingWallpaperUpdater.Core.Io;
+using BingWallpaperUpdater.Core.Json;
+
 namespace BingWallpaperUpdater.Core.Model;
 
 /// <summary>
@@ -15,4 +18,17 @@ public sealed class AppState
     /// <summary>ID of the image last applied successfully.</summary>
     public string? CurrentImageId { get; set; }
     public DateTimeOffset? LastAppliedUtc { get; set; }
+
+    /// <summary>Loads the file, or returns a fresh state when it is missing or corrupt (no write-back needed).</summary>
+    public static AppState LoadOrCreate(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        return AtomicJsonFile.Load(path, CoreJsonContext.Default.AppState) ?? new AppState();
+    }
+
+    public void Save(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        AtomicJsonFile.Save(path, this, CoreJsonContext.Default.AppState);
+    }
 }
