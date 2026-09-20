@@ -32,7 +32,11 @@ public static class BingImageUrl
         return new Uri(url, UriKind.Absolute);
     }
 
-    /// <summary>HPImageArchive JSON endpoint. Bing caps <c>idx</c> at 7 and <c>n</c> at 8; <c>n=0</c> returns literal null.</summary>
+    /// <summary>
+    /// HPImageArchive JSON endpoint. Bing caps <c>idx</c> at 7 and <c>n</c> at 8; <c>n=0</c> returns literal null.
+    /// <paramref name="market"/> is percent-encoded so a user-edited value can only ever be the <c>mkt</c> value,
+    /// never an extra query parameter or an invalid URI (WR-06; <c>Settings.Sanitize</c> normalises it first).
+    /// </summary>
     public static Uri Archive(string host, int idx, int n, string market)
     {
         ArgumentException.ThrowIfNullOrEmpty(host);
@@ -43,7 +47,7 @@ public static class BingImageUrl
         ArgumentOutOfRangeException.ThrowIfGreaterThan(n, 8);
 
         return new Uri(
-            string.Create(CultureInfo.InvariantCulture, $"https://{host}/HPImageArchive.aspx?format=js&idx={idx}&n={n}&mkt={market}"),
+            string.Create(CultureInfo.InvariantCulture, $"https://{host}/HPImageArchive.aspx?format=js&idx={idx}&n={n}&mkt={Uri.EscapeDataString(market)}"),
             UriKind.Absolute);
     }
 

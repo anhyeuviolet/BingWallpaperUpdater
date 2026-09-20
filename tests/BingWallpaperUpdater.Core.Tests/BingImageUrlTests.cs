@@ -86,6 +86,18 @@ public sealed class BingImageUrlTests
         Assert.Equal($"/HPImageArchive.aspx?format=js&idx={idx}&n={n}&mkt=de-DE", url.PathAndQuery);
     }
 
+    /// <summary>WR-06: a user-edited market can only ever be the mkt value — never a second parameter or an invalid URI.</summary>
+    [Fact]
+    public void Archive_MarketIsPercentEncoded_SoItCannotAddQueryParameters()
+    {
+        Uri url = BingImageUrl.Archive("www.bing.com", 0, 8, "en-US&idx=7");
+
+        Assert.Equal("/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=en-US%26idx%3D7", url.PathAndQuery);
+        Assert.Equal("www.bing.com", url.Host);
+        Assert.Single(url.Query.Split('&'), part => part.StartsWith("idx=", StringComparison.Ordinal));
+        Assert.Null(Record.Exception(() => BingImageUrl.Archive("www.bing.com", 0, 8, "en-US\u0001 x")));
+    }
+
     [Fact]
     public void MinDimensions_Uhd_Is3840x2160()
     {
