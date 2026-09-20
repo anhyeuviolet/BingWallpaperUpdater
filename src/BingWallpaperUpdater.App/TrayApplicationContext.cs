@@ -30,6 +30,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly SessionEndingEventHandler _sessionEnding;
     private readonly HttpGateway _http;
     private readonly RotationService _rotation;
+    private readonly PowerWindow _powerWindow;
     private int _shutdownRequested;
     private bool _disposed;
 
@@ -70,6 +71,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         var dispatcher = new WinFormsUiDispatcher(ui);
         _rotation = new RotationService(settings, state, AppPaths.StatePath, catalog, cache, _http, applier, dispatcher);
 
+        // D-10 resume fast path: the hidden window only re-arms the heartbeat (8 s debounce); the heartbeat runs the check.
+        _powerWindow = new PowerWindow();
+        _powerWindow.Resumed += source => _rotation.Nudge(source);
+
         TimeSpan initialDelay = startup ? TimeSpan.FromSeconds(Random.Shared.Next(30, 61)) : TimeSpan.Zero;
         Log.Info($"schedule start launch={(startup ? "autostart" : "manual")} firstTickIn={(int)initialDelay.TotalSeconds}s interval={settings.IntervalMinutes} mode={settings.Mode}");
         _rotation.Start(initialDelay, _cts.Token);
@@ -104,6 +109,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             SystemEvents.SessionEnding -= _sessionEnding;
             _cts.Cancel();
             _rotation.Dispose();
+            _powerWindow.Dispose();
             _icon.Visible = false;
             _icon.Dispose();
             _http.Dispose();
