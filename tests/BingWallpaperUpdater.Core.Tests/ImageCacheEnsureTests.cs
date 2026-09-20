@@ -217,10 +217,10 @@ public sealed class ImageCacheEnsureTests : IDisposable
     }
 
     [Fact]
-    public void ThrowingHandler_ThrowsOnAnyUse()
+    public async Task ThrowingHandler_ThrowsOnAnyUse()
     {
         using var client = new HttpClient(new ThrowingHandler());
 
-        Assert.ThrowsAsync<InvalidOperationException>(() => client.GetAsync("https://www.bing.com/")).GetAwaiter().GetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => client.GetAsync("https://www.bing.com/"));
     }
 }
