@@ -23,8 +23,19 @@ public sealed partial class Settings
     public const string SameMonitorMode = "same";
     public const string PerMonitorMode = "perMonitor";
 
-    /// <summary>The resolutions the pipeline knows how to request and validate (see <c>BingImageUrl.MinDimensions</c>).</summary>
-    public static readonly IReadOnlyList<string> KnownResolutions = ["UHD", "1920x1200", "1920x1080"];
+    /// <summary>
+    /// The "largest attached monitor" resolution choice (SRC-07). Only ever a setting value: <c>ResolutionPolicy</c>
+    /// turns it into one of the three concrete resolutions at the top of every tick, so it never reaches
+    /// <c>BingImageUrl.MinDimensions</c>, <c>CacheFileName</c> or a cache entry.
+    /// </summary>
+    public const string AutoResolution = "Auto";
+
+    /// <summary>
+    /// The resolution choices offered in the UI, in display order: <see cref="AutoResolution"/> plus the three concrete
+    /// values the pipeline knows how to request and validate (see <c>BingImageUrl.MinDimensions</c>). The default stays
+    /// <see cref="DefaultResolution"/>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> KnownResolutions = [AutoResolution, "UHD", "1920x1200", "1920x1080"];
 
     /// <summary>
     /// UI language choices (L10N-02, L10N-03): <c>auto</c> follows the Windows display language (en or vi, else en),
@@ -56,7 +67,11 @@ public sealed partial class Settings
     /// <summary>Bing market; the catalog IDs carry <c>EN-US</c> so this defaults to <c>en-US</c>.</summary>
     public string Market { get; set; } = DefaultMarket;
 
-    /// <summary>"UHD" (original <c>_UHD.jpg</c>), "1920x1200" or "1920x1080".</summary>
+    /// <summary>
+    /// "UHD" (original <c>_UHD.jpg</c>, the default), "1920x1200", "1920x1080", or "Auto" = the largest attached
+    /// monitor, resolved to one of the three concrete values per tick by <c>ResolutionPolicy</c> (SRC-07); "Auto" is
+    /// never stored in a cache entry, a file name or a Bing URL.
+    /// </summary>
     public string Resolution { get; set; } = DefaultResolution;
 
     /// <summary>Rotation interval in minutes, one of <see cref="AllowedIntervals"/> (D-08).</summary>
@@ -91,6 +106,10 @@ public sealed partial class Settings
     /// <summary>True when <see cref="MonitorMode"/> is <see cref="PerMonitorMode"/>; computed, never serialised.</summary>
     [JsonIgnore]
     public bool IsPerMonitor => string.Equals(MonitorMode, PerMonitorMode, StringComparison.Ordinal);
+
+    /// <summary>True when <see cref="Resolution"/> is <see cref="AutoResolution"/> (SRC-07); computed, never serialised.</summary>
+    [JsonIgnore]
+    public bool IsAutoResolution => string.Equals(Resolution, AutoResolution, StringComparison.Ordinal);
 
     // Two ASCII letters, a hyphen, two ASCII letters — the only shape the Bing mkt parameter takes.
     [GeneratedRegex("^[A-Za-z]{2}-[A-Za-z]{2}$", RegexOptions.CultureInvariant)]
@@ -127,7 +146,8 @@ public sealed partial class Settings
     /// <see cref="Market"/> must be <c>xx-YY</c> (case is canonicalised: <c>EN-us</c> becomes <c>en-US</c>); anything
     /// else — <c>null</c>, a query-string injection such as <c>en-US&amp;idx=7</c>, control characters — becomes
     /// <see cref="DefaultMarket"/>. <see cref="Resolution"/> is matched against <see cref="KnownResolutions"/> ignoring
-    /// case (<c>uhd</c> becomes <c>UHD</c>); an unknown value such as <c>4K</c> becomes <see cref="DefaultResolution"/>.
+    /// case (<c>uhd</c> becomes <c>UHD</c>, <c>auto</c> becomes <c>Auto</c>); an unknown value such as <c>4K</c> becomes
+    /// <see cref="DefaultResolution"/>.
     /// Each replacement is logged once so the user can see why the file's value was not honoured.
     /// </summary>
     public bool Sanitize()

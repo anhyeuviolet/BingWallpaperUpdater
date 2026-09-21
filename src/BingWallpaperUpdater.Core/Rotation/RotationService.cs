@@ -1,6 +1,7 @@
 using BingWallpaperUpdater.Core.Cache;
 using BingWallpaperUpdater.Core.Catalog;
 using BingWallpaperUpdater.Core.Diagnostics;
+using BingWallpaperUpdater.Core.Display;
 using BingWallpaperUpdater.Core.Model;
 using BingWallpaperUpdater.Core.Net;
 using BingWallpaperUpdater.Core.Pipeline;
@@ -29,6 +30,7 @@ public sealed class RotationService : IDisposable
     private readonly HttpGateway _http;
     private readonly IWallpaperApplier _applier;
     private readonly IUiDispatcher _ui;
+    private readonly IMonitorLayout _monitors;
     private readonly TimeProvider _time;
     private readonly Random _random;
 
@@ -58,6 +60,7 @@ public sealed class RotationService : IDisposable
         HttpGateway http,
         IWallpaperApplier applier,
         IUiDispatcher ui,
+        IMonitorLayout monitors,
         TimeProvider? time = null,
         Random? random = null)
     {
@@ -69,6 +72,7 @@ public sealed class RotationService : IDisposable
         ArgumentNullException.ThrowIfNull(http);
         ArgumentNullException.ThrowIfNull(applier);
         ArgumentNullException.ThrowIfNull(ui);
+        ArgumentNullException.ThrowIfNull(monitors);
         if (!Settings.AllowedIntervals.Contains(settings.IntervalMinutes))
         {
             // Settings.LoadOrCreate sanitises the file, so this is a programming error; rejecting it here keeps a
@@ -84,6 +88,7 @@ public sealed class RotationService : IDisposable
         _http = http;
         _applier = applier;
         _ui = ui;
+        _monitors = monitors;
         _time = time ?? TimeProvider.System;
         _random = random ?? Random.Shared;
         _appliedIntervalMinutes = settings.IntervalMinutes;
@@ -407,7 +412,20 @@ public sealed class RotationService : IDisposable
     private async Task<TickResult> TickCoreAsync(TickReason reason, CancellationToken ct)
     {
         DateTimeOffset now = _time.GetUtcNow();
-        Log.Info($"tick reason={reason} mode={_settings.Mode} interval={_appliedIntervalMinutes}");
+
+        // The effective resolution is fixed once per tick, BEFORE the decider and the download stage see it (SRC-07,
+        // Pitfall 3): "Auto" would throw in BingImageUrl.MinDimensions / CacheFileName.For, so nothing below reads
+        // the raw setting — only this local.
+        IReadOnlyList<(int Width, int Height)> sizes = MonitorSizes();
+        string resolution = EffectiveResolution(sizes);
+        string autoToken = "-";
+        if (_settings.IsAutoResolution && sizes.Count > 0)
+        {
+            (int largestWidth, int largestHeight) = sizes.MaxBy(m => (long)m.Width * m.Height);
+            autoToken = $"{largestWidth}x{largestHeight}";
+        }
+
+        Log.Info($"tick reason={reason} mode={_settings.Mode} interval={_appliedIntervalMinutes} resolution={resolution} auto={autoToken}");
 
         bool intervalDue = ScheduleMath.IsDue(now, ReadNextDue());   // captured BEFORE any re-arm
 
@@ -436,14 +454,14 @@ public sealed class RotationService : IDisposable
             // 2. decide
             IReadOnlyList<CachedImage> candidates = RotationDecider.Candidates(
                 _cache.Index.Images,
-                _settings.Resolution,
+                resolution,
                 i => File.Exists(Path.Combine(_cache.CacheDir, i.File)));
             decision = RotationDecider.Decide(reason, _settings.IsRandomMode, entry, _state, candidates, intervalDue, _random);
 
             // 3. ensure
             if (decision.Kind == DecisionKind.ApplyNew)
             {
-                CachedImage? cached = await _cache.EnsureAsync(decision.Entry!, _settings.Resolution, _http, ct).ConfigureAwait(false);
+                CachedImage? cached = await _cache.EnsureAsync(decision.Entry!, resolution, _http, ct).ConfigureAwait(false);
                 if (cached is null)
                 {
                     fetchFailed = true;
@@ -578,6 +596,32 @@ public sealed class RotationService : IDisposable
             return _state.NextDueUtc;
         }
     }
+
+    /// <summary>
+    /// The attached monitors from the <see cref="IMonitorLayout"/> port, or an empty list when the adapter throws
+    /// (a WinForms / display hiccup then degrades "Auto" to UHD with a warning instead of a Failed tick).
+    /// </summary>
+    private IReadOnlyList<(int Width, int Height)> MonitorSizes()
+    {
+        try
+        {
+            return _monitors.Sizes();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("monitor layout failed", ex);
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// The one place the raw resolution setting is read for the pipeline (SRC-07): "Auto" becomes a concrete value
+    /// through <see cref="ResolutionPolicy"/>, an explicit value passes through unchanged. Pure — cannot throw on a
+    /// sanitised setting. Every consumer (the decider, <c>EnsureAsync</c>, the tick log line, and Plan 03-04's
+    /// re-apply) must go through this helper rather than the setting itself, so "Auto" can never leak into
+    /// <c>BingImageUrl.MinDimensions</c>, <c>CacheFileName</c> or a cache entry.
+    /// </summary>
+    private string EffectiveResolution(IReadOnlyList<(int Width, int Height)> sizes) => ResolutionPolicy.Resolve(_settings.Resolution, sizes);
 
     /// <summary>
     /// Serialises <see cref="AppState"/> under <c>_sync</c> (WR-03): the schedule fields are written under that lock

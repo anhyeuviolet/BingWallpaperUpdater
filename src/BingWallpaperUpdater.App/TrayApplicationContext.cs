@@ -109,7 +109,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             var catalog = new CatalogService(_http, state, AppPaths.CatalogBodyPath);
             IWallpaperApplier applier = new DesktopWallpaperApplier();
             var dispatcher = new WinFormsUiDispatcher(ui);
-            rotation = new RotationService(settings, state, AppPaths.StatePath, catalog, cache, _http, applier, dispatcher);
+            rotation = new RotationService(settings, state, AppPaths.StatePath, catalog, cache, _http, applier, dispatcher, new ScreenMonitorLayout());
 
             // D-10 resume fast path: the hidden window only re-arms the heartbeat (8 s debounce); the heartbeat runs the check.
             powerWindow = new PowerWindow();

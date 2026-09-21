@@ -26,6 +26,28 @@ internal sealed class InlineUiDispatcher : IUiDispatcher
     }
 }
 
+/// <summary><see cref="IMonitorLayout"/> returning a settable list (swap <see cref="Sizes"/> mid-test to simulate a display change); <see cref="Throw"/> makes the next call throw.</summary>
+internal sealed class FakeMonitorLayout(IReadOnlyList<(int Width, int Height)> sizes) : IMonitorLayout
+{
+    public IReadOnlyList<(int Width, int Height)> Sizes { get; set; } = sizes;
+
+    /// <summary>When non-null, every <see cref="IMonitorLayout.Sizes"/> call throws it (the "monitor layout failed" path).</summary>
+    public Exception? Throw { get; set; }
+
+    public int Calls { get; private set; }
+
+    IReadOnlyList<(int Width, int Height)> IMonitorLayout.Sizes()
+    {
+        Calls++;
+        if (Throw is { } pending)
+        {
+            throw pending;
+        }
+
+        return Sizes;
+    }
+}
+
 /// <summary>
 /// <see cref="IUiDispatcher"/> that parks every delegate until the test calls <see cref="Release"/>, so a tick can be
 /// held in flight at its apply step (the Busy / IsTickRunning tests).

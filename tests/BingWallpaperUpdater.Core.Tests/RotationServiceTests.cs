@@ -256,7 +256,7 @@ public sealed class RotationServiceTests : IDisposable
 
     private sealed record Harness(RotationService Service, AppState State, FakeApplier Applier, FakeHttpHandler Http, ImageCache Cache);
 
-    private Harness Build(Settings settings, AppState state, ImageCache? cache = null, FakeHttpHandler? fake = null, FakeApplier? applier = null, Core.Ports.IUiDispatcher? dispatcher = null)
+    private Harness Build(Settings settings, AppState state, ImageCache? cache = null, FakeHttpHandler? fake = null, FakeApplier? applier = null, Core.Ports.IUiDispatcher? dispatcher = null, Core.Ports.IMonitorLayout? monitors = null)
     {
         fake ??= Routes();
         applier ??= new FakeApplier();
@@ -264,7 +264,7 @@ public sealed class RotationServiceTests : IDisposable
         var http = new HttpGateway(fake, retry: NoDelay()) { DownloadRoot = _dir };
         _owned.Add(http);
         var catalog = new CatalogService(http, state, _catalogPath);
-        var service = new RotationService(settings, state, _statePath, catalog, cache, http, applier, dispatcher ?? new InlineUiDispatcher(), _time, new Random(20260920));
+        var service = new RotationService(settings, state, _statePath, catalog, cache, http, applier, dispatcher ?? new InlineUiDispatcher(), monitors ?? new FakeMonitorLayout([(1920, 1080)]), _time, new Random(20260920));
         _owned.Add(service);
         return new Harness(service, state, applier, fake, cache);
     }
@@ -1645,5 +1645,106 @@ public sealed class RotationServiceTests : IDisposable
         Assert.False(h.Service.IsTickRunning);
         Assert.Contains("state changed handler failed", LogText());
         Assert.Contains("ui handler bug", LogText());
+    }
+
+    // ---- Phase 3 (03-02): Auto resolution is resolved once per tick, before the decider and the download stage (SRC-07) ----
+
+    private static Settings AutoResolution() => new() { IntervalMinutes = 30, Mode = Settings.DefaultMode, Resolution = Settings.AutoResolution };
+
+    private List<RecordedRequest> ImageRequests(Harness h) =>
+        h.Http.Requests.Where(r => r.Uri.AbsolutePath.StartsWith(ImagePath, StringComparison.Ordinal)).ToList();
+
+    /// <summary>
+    /// The invariant test for the promoted noun: under "Auto" the download URL carries the concrete w/h, the cache entry
+    /// stores the concrete resolution, and "Auto" never reaches BingImageUrl.MinDimensions / CacheFileName (Pitfall 3).
+    /// </summary>
+    [Fact]
+    public async Task Auto_ResolvesBeforeEnsure_NeverReachesDownloadOrCache()
+    {
+        var layout = new FakeMonitorLayout([(1920, 1080)]);
+        Settings settings = AutoResolution();
+        Harness h = Build(settings, new AppState(), monitors: layout);
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.Equal(TickResult.Applied, result);
+        Assert.Equal(1, layout.Calls);
+        Assert.Equal(Settings.AutoResolution, settings.Resolution);   // the setting itself is untouched; only the tick's local is concrete
+        RecordedRequest image = Assert.Single(ImageRequests(h));
+        Assert.Contains("w=1920&h=1080", image.Uri.Query, StringComparison.Ordinal);
+        CachedImage entry = Assert.Single(h.Cache.Index.Images);
+        Assert.Equal("1920x1080", entry.Resolution);
+        Assert.EndsWith(".1920x1080.jpg", entry.File, StringComparison.Ordinal);
+        Assert.DoesNotContain("Auto", entry.File, StringComparison.OrdinalIgnoreCase);
+
+        string log = LogText();
+        Assert.Contains("tick reason=Startup mode=newest interval=30 resolution=1920x1080 auto=1920x1080", log);
+        Assert.DoesNotContain("tick failed", log);
+        Assert.DoesNotContain("unknown resolution", log);
+    }
+
+    [Fact]
+    public async Task Auto_NoMonitors_UsesUhd()
+    {
+        Harness h = Build(AutoResolution(), new AppState(), monitors: new FakeMonitorLayout([]));
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.Equal(TickResult.Applied, result);
+        RecordedRequest image = Assert.Single(ImageRequests(h));
+        Assert.DoesNotContain("w=", image.Uri.Query, StringComparison.Ordinal);
+        Assert.Equal("UHD", Assert.Single(h.Cache.Index.Images).Resolution);
+        Assert.Contains("resolution=UHD auto=-", LogText());
+        Assert.DoesNotContain("tick failed", LogText());
+    }
+
+    [Fact]
+    public async Task Auto_LayoutThrows_DegradesToUhd()
+    {
+        var layout = new FakeMonitorLayout([(3840, 2160)]) { Throw = new InvalidOperationException("screen enumeration bug") };
+        Harness h = Build(AutoResolution(), new AppState(), monitors: layout);
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.Equal(TickResult.Applied, result);
+        Assert.Equal("UHD", Assert.Single(h.Cache.Index.Images).Resolution);
+        string log = LogText();
+        Assert.Contains("monitor layout failed", log);
+        Assert.Contains("screen enumeration bug", log);
+        Assert.Contains("resolution=UHD auto=-", log);
+        Assert.DoesNotContain("tick failed", log);
+    }
+
+    /// <summary>The largest monitor by area wins, and an explicit setting ignores the layout entirely.</summary>
+    [Fact]
+    public async Task Auto_TwoMonitors_LargestWins_AndExplicitSettingIgnoresLayout()
+    {
+        var layout = new FakeMonitorLayout([(1920, 1080), (3840, 2160)]);
+        Harness auto = Build(AutoResolution(), new AppState(), monitors: layout);
+        await auto.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        Assert.Contains("resolution=UHD auto=3840x2160", LogText());
+        Assert.Equal("UHD", Assert.Single(auto.Cache.Index.Images).Resolution);
+
+        Settings explicitSetting = Newest();
+        explicitSetting.Resolution = "1920x1200";
+        Harness fixedRes = Build(explicitSetting, new AppState(), SeedCache([]), monitors: new FakeMonitorLayout([(3840, 2160)]));
+        await fixedRes.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        Assert.Contains("resolution=1920x1200 auto=-", LogText());
+        Assert.Equal("1920x1200", Assert.Single(fixedRes.Cache.Index.Images).Resolution);
+    }
+
+    /// <summary>A resolution change in the window is used at the next tick with no restart (criterion 2): the setting is read live.</summary>
+    [Fact]
+    public async Task Auto_DisplayChangeBetweenTicks_NextTickUsesNewLayout()
+    {
+        var layout = new FakeMonitorLayout([(1920, 1080)]);
+        Harness h = Build(AutoResolution(), new AppState(), monitors: layout);
+        await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        Assert.Contains("resolution=1920x1080 auto=1920x1080", LogText());
+
+        layout.Sizes = [(2560, 1440)];
+        await h.Service.RunTickAsync(TickReason.Next, CancellationToken.None);
+
+        Assert.Contains("tick reason=Next mode=newest interval=30 resolution=UHD auto=2560x1440", LogText());
     }
 }

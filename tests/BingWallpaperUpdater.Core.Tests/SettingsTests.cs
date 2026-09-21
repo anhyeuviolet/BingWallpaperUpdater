@@ -67,6 +67,10 @@ public sealed class SettingsTests : IDisposable
     [InlineData("3840x2160", "UHD", true)]
     [InlineData("", "UHD", true)]
     [InlineData(null, "UHD", true)]
+    [InlineData("Auto", "Auto", false)]
+    [InlineData("auto", "Auto", true)]
+    [InlineData("AUTO", "Auto", true)]
+    [InlineData(" Auto ", "Auto", true)]
     public void Sanitize_Resolution_MatchesKnownValuesIgnoringCaseOrFallsBackToUhd(string? input, string expected, bool expectChanged)
     {
         var settings = new Settings { Resolution = input! };
@@ -77,7 +81,39 @@ public sealed class SettingsTests : IDisposable
         Assert.Equal(expectChanged, changed);
     }
 
-    /// <summary>Every value Sanitize lets through is one the download stage can act on without throwing.</summary>
+    /// <summary>SRC-07: Auto is offered (first, so the ComboBox built from KnownResolutions lists it) but the default stays UHD.</summary>
+    [Fact]
+    public void Resolution_DefaultIsUhd_AutoIsKnownButNotDefault()
+    {
+        var settings = new Settings();
+
+        Assert.Equal("UHD", Settings.DefaultResolution);
+        Assert.Equal("UHD", settings.Resolution);
+        Assert.False(settings.IsAutoResolution);
+        Assert.Equal("Auto", Settings.AutoResolution);
+        Assert.Equal(["Auto", "UHD", "1920x1200", "1920x1080"], Settings.KnownResolutions);
+
+        settings.Resolution = "auto";
+        Assert.False(settings.IsAutoResolution);   // ordinal: only the canonical value counts
+        settings.Sanitize();
+        Assert.True(settings.IsAutoResolution);
+    }
+
+    /// <summary>Auto survives a save/load round trip as the setting value; it is the tick, not the file, that makes it concrete.</summary>
+    [Fact]
+    public void Save_RoundTrips_AutoResolution()
+    {
+        string path = Path.Combine(_dir, "settings.json");
+        new Settings { Resolution = Settings.AutoResolution }.Save(path);
+
+        Settings loaded = Settings.LoadOrCreate(path);
+
+        Assert.Equal("Auto", loaded.Resolution);
+        Assert.True(loaded.IsAutoResolution);
+        Assert.DoesNotContain("settings invalid field=Resolution", LogText());
+    }
+
+    /// <summary>Every concrete value Sanitize lets through is one the download stage can act on without throwing (Auto is the one exception: ResolutionPolicy makes it concrete before the download stage, see ResolutionPolicyTests).</summary>
     [Theory]
     [InlineData("uhd")]
     [InlineData("4K")]
