@@ -1072,6 +1072,44 @@ public sealed class RotationServiceTests : IDisposable
     }
 
     [Fact]
+    public void Ctor_IntervalOutsideAllowed_Throws()
+    {
+        // Settings.LoadOrCreate sanitises the file, so an unlisted interval here is a programming error (WR-02).
+        var settings = new Settings { IntervalMinutes = 0, Mode = Settings.DefaultMode };
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => Build(settings, new AppState()));
+    }
+
+    [Fact]
+    public async Task ApplySettings_IntervalOutsideAllowed_LogsKeepsScheduleAndHeartbeatSurvives()
+    {
+        Settings settings = Newest();
+        Harness h = Build(settings, new AppState());
+        await StartAsync(h);                                 // applies at T0, NextDueUtc = T0 + 30 min
+        h.Applier.Reset();
+
+        settings.IntervalMinutes = 0;                        // a value the settings window must never produce (WR-02)
+        h.Service.ApplySettings();                           // used to throw here, and the next beat used to kill the process
+
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);   // the schedule keeps the last accepted interval
+        Assert.Contains("settings rejected field=IntervalMinutes value=0 keeping=30", LogText());
+        Assert.Contains($"settings applied interval=30 mode=newest next={(T0 + Interval):O}", LogText());
+
+        await AdvanceAsync(h, Interval);                     // 30 beats and the interval-due tick, all on the applied interval
+
+        Assert.Equal(0, LogCount("heartbeat failed"));
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Contains("tick reason=Interval mode=newest interval=30", LogText());
+        Assert.Equal(_time.GetUtcNow() + Interval, h.Service.NextDueUtc);   // re-armed with 30 min, never with 0
+
+        settings.IntervalMinutes = 60;                       // a listed value is accepted again
+        h.Service.ApplySettings();
+
+        Assert.Equal(T0 + TimeSpan.FromMinutes(60), h.Service.NextDueUtc);   // LastAppliedUtc (T0) + 60 min
+        Assert.Contains("settings applied interval=60 mode=newest", LogText());
+    }
+
+    [Fact]
     public async Task Startup_WithJitter_NoTickBeforeDelay_ThenExactlyOne()
     {
         Harness h = Build(Newest(), new AppState());

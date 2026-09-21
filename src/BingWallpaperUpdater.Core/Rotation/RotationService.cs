@@ -68,6 +68,12 @@ public sealed class RotationService : IDisposable
         ArgumentNullException.ThrowIfNull(http);
         ArgumentNullException.ThrowIfNull(applier);
         ArgumentNullException.ThrowIfNull(ui);
+        if (!Settings.AllowedIntervals.Contains(settings.IntervalMinutes))
+        {
+            // Settings.LoadOrCreate sanitises the file, so this is a programming error; rejecting it here keeps a
+            // non-positive interval away from ScheduleMath, which throws on it (WR-02).
+            throw new ArgumentOutOfRangeException(nameof(settings), settings.IntervalMinutes, "IntervalMinutes must be one of Settings.AllowedIntervals");
+        }
 
         _settings = settings;
         _state = state;
@@ -87,6 +93,14 @@ public sealed class RotationService : IDisposable
 
     /// <summary>Mirrors <see cref="AppState.NextDueUtc"/>.</summary>
     public DateTimeOffset? NextDueUtc => _state.NextDueUtc;
+
+    /// <summary>
+    /// The interval every schedule computation uses: the last value <see cref="ApplySettings"/> accepted (or the
+    /// constructor validated), never the raw <see cref="Settings.IntervalMinutes"/>, so a value the settings window
+    /// wrote outside <see cref="Settings.AllowedIntervals"/> can never reach <see cref="ScheduleMath"/> (WR-02).
+    /// Read under <c>_sync</c> wherever it feeds a due time.
+    /// </summary>
+    private TimeSpan Interval => TimeSpan.FromMinutes(_appliedIntervalMinutes);
 
     /// <summary>In-memory backoff due time; null when no retry is pending (D-13). Never persisted.</summary>
     public DateTimeOffset? RetryDueUtc
@@ -190,7 +204,7 @@ public sealed class RotationService : IDisposable
         DateTimeOffset now = _time.GetUtcNow();
         lock (_sync)
         {
-            _state.NextDueUtc = ScheduleMath.ClampAfterClockChange(now, _state.NextDueUtc, _settings.Interval);
+            _state.NextDueUtc = ScheduleMath.ClampAfterClockChange(now, _state.NextDueUtc, Interval);
         }
 
         TrySaveState();
@@ -205,6 +219,8 @@ public sealed class RotationService : IDisposable
     /// <see cref="ScheduleMath.AfterIntervalChange"/>). A mode change needs no bookkeeping because every tick reads
     /// <see cref="Settings.IsRandomMode"/> live. Persists, logs <c>settings applied ...</c>, then nudges so a shortened
     /// interval that is already due runs within the debounce instead of up to 60 s later. Safe to call repeatedly.
+    /// An interval outside <see cref="Settings.AllowedIntervals"/> is logged and ignored: the schedule keeps running
+    /// on the last accepted interval (WR-02).
     /// </summary>
     public void ApplySettings()
     {
@@ -213,18 +229,26 @@ public sealed class RotationService : IDisposable
             return;
         }
 
+        int requested = _settings.IntervalMinutes;
         DateTimeOffset now = _time.GetUtcNow();
         lock (_sync)
         {
-            if (_settings.IntervalMinutes != _appliedIntervalMinutes)
+            if (requested != _appliedIntervalMinutes)
             {
-                _state.NextDueUtc = ScheduleMath.AfterIntervalChange(_state.LastAppliedUtc, now, _settings.Interval);
-                _appliedIntervalMinutes = _settings.IntervalMinutes;
+                if (Settings.AllowedIntervals.Contains(requested))
+                {
+                    _state.NextDueUtc = ScheduleMath.AfterIntervalChange(_state.LastAppliedUtc, now, TimeSpan.FromMinutes(requested));
+                    _appliedIntervalMinutes = requested;
+                }
+                else
+                {
+                    Log.Warn($"settings rejected field=IntervalMinutes value={requested} keeping={_appliedIntervalMinutes}");
+                }
             }
         }
 
         TrySaveState();
-        Log.Info($"settings applied interval={_settings.IntervalMinutes} mode={_settings.Mode} next={_state.NextDueUtc?.ToString("O") ?? "-"}");
+        Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} next={_state.NextDueUtc?.ToString("O") ?? "-"}");
         Nudge("settings");
     }
 
@@ -278,6 +302,20 @@ public sealed class RotationService : IDisposable
 
     private void OnHeartbeat()
     {
+        // A System.Threading.Timer callback runs on a thread-pool thread: anything that escapes it is an unhandled
+        // exception that terminates the process. RunTickAsync never throws; this guard covers the beat itself (WR-02).
+        try
+        {
+            OnHeartbeatCore();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("heartbeat failed", ex);
+        }
+    }
+
+    private void OnHeartbeatCore()
+    {
         if (_disposed || IsTickRunning)
         {
             return; // a beat during an in-flight tick is a silent no-op; only Next logs "busy"
@@ -287,7 +325,7 @@ public sealed class RotationService : IDisposable
         DateTimeOffset? retryDue;
         lock (_sync)
         {
-            _state.NextDueUtc = ScheduleMath.ClampAfterClockChange(now, _state.NextDueUtc, _settings.Interval);   // D-07, idempotent
+            _state.NextDueUtc = ScheduleMath.ClampAfterClockChange(now, _state.NextDueUtc, Interval);   // D-07, idempotent
             retryDue = _retryDueUtc;
         }
 
@@ -318,7 +356,7 @@ public sealed class RotationService : IDisposable
     private async Task<TickResult> TickCoreAsync(TickReason reason, CancellationToken ct)
     {
         DateTimeOffset now = _time.GetUtcNow();
-        Log.Info($"tick reason={reason} mode={_settings.Mode} interval={_settings.IntervalMinutes}");
+        Log.Info($"tick reason={reason} mode={_settings.Mode} interval={_appliedIntervalMinutes}");
 
         bool intervalDue = ScheduleMath.IsDue(now, _state.NextDueUtc);   // captured BEFORE any re-arm
 
@@ -419,7 +457,7 @@ public sealed class RotationService : IDisposable
             if ((reason == TickReason.Next && result == TickResult.Applied)
                 || (reason != TickReason.Retry && ScheduleMath.IsDue(now, _state.NextDueUtc)))
             {
-                _state.NextDueUtc = ScheduleMath.Rearm(now, _settings.Interval);
+                _state.NextDueUtc = ScheduleMath.Rearm(now, Interval);
             }
 
             // The ladder (D-13): 5 min after the first failure, 15 min after the second, then nothing until the
