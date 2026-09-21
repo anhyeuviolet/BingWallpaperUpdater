@@ -293,6 +293,9 @@ public sealed class RotationService : IDisposable
 
         if (!_startupTickDone)
         {
+            // Set at dispatch, not on completion: a Startup tick that fails, throws or loses the gate to a Next click is
+            // never replayed on the next beat (D-11); a still-due NextDueUtc is picked up by the Interval branch below.
+            _startupTickDone = true;
             _ = RunTickAsync(TickReason.Startup, _ct);
             return;
         }
@@ -319,77 +322,100 @@ public sealed class RotationService : IDisposable
 
         bool intervalDue = ScheduleMath.IsDue(now, _state.NextDueUtc);   // captured BEFORE any re-arm
 
-        // 1. fetch — one conditional GET per tick (D-02); null means neither source produced a row (Pitfall 5).
-        CatalogEntry? entry = await _catalog.GetNewestAsync(_settings.Market, ct).ConfigureAwait(false);
-        _state.LastCheckUtc = now;
-        bool fetchFailed = entry is null;
-
-        // 2. decide
-        IReadOnlyList<CachedImage> candidates = RotationDecider.Candidates(
-            _cache.Index.Images,
-            _settings.Resolution,
-            i => File.Exists(Path.Combine(_cache.CacheDir, i.File)));
-        RotationDecision decision = RotationDecider.Decide(reason, _settings.IsRandomMode, entry, _state, candidates, intervalDue, _random);
-
-        // 3. ensure
+        // Everything step 5/6 reads is declared here so the tail runs whatever steps 1-4 did — including throwing
+        // (G-01 / CR-01): before this try/catch an exception skipped the re-arm, the ladder and the save, and the
+        // heartbeat re-dispatched a full tick (two network requests plus the failing step) every 60 s.
+        bool fetchFailed = false;
+        bool threw = false;
         string? path = null;
         ImageId id = default;
-        if (decision.Kind == DecisionKind.ApplyNew)
-        {
-            CachedImage? cached = await _cache.EnsureAsync(decision.Entry!, _settings.Resolution, _http, ct).ConfigureAwait(false);
-            if (cached is null)
-            {
-                fetchFailed = true;
-                decision = RotationDecider.Decide(reason, _settings.IsRandomMode, null, _state, candidates, intervalDue, _random);
-            }
-            else
-            {
-                path = Path.GetFullPath(Path.Combine(_cache.CacheDir, cached.File));
-                id = decision.Entry!.Id;
-            }
-        }
-
-        if (decision.Kind is DecisionKind.StepOlder or DecisionKind.Random)
-        {
-            if (ImageId.TryParse(decision.Target!.Id, out id))
-            {
-                path = Path.GetFullPath(Path.Combine(_cache.CacheDir, decision.Target.File));
-            }
-            else
-            {
-                Log.Warn($"rotation skipped id={decision.Target.Id} reason=bad-id");
-                decision = new RotationDecision(DecisionKind.NoOp, null, null, "bad-id");
-            }
-        }
-
-        if (decision.Kind == DecisionKind.SeedLastSeen)
-        {
-            _state.LastSeenNewestId = decision.Entry!.Id.Value;
-        }
-
-        // 4. apply — awaitable STA hop; LastSeenNewestId is written only after ApplyStage reports Ok (D-03, T-02-06).
+        RotationDecision? decision = null;
         TickResult result = TickResult.NoOp;
-        if (path is not null)
+
+        try
         {
-            string applyPath = path;
-            ImageId applyId = id;
-            ApplyResult apply = await _ui.InvokeAsync(
-                () => ApplyStage.Run(_applier, applyPath, applyId, _cache, _state, _statePath, now), ct).ConfigureAwait(false);
-            if (apply.Ok && decision.Kind == DecisionKind.ApplyNew)
+            // 1. fetch — one conditional GET per tick (D-02); null means neither source produced a row (Pitfall 5).
+            CatalogEntry? entry = await _catalog.GetNewestAsync(_settings.Market, ct).ConfigureAwait(false);
+            _state.LastCheckUtc = now;
+            fetchFailed = entry is null;
+
+            // 2. decide
+            IReadOnlyList<CachedImage> candidates = RotationDecider.Candidates(
+                _cache.Index.Images,
+                _settings.Resolution,
+                i => File.Exists(Path.Combine(_cache.CacheDir, i.File)));
+            decision = RotationDecider.Decide(reason, _settings.IsRandomMode, entry, _state, candidates, intervalDue, _random);
+
+            // 3. ensure
+            if (decision.Kind == DecisionKind.ApplyNew)
             {
-                _state.LastSeenNewestId = applyId.Value;
+                CachedImage? cached = await _cache.EnsureAsync(decision.Entry!, _settings.Resolution, _http, ct).ConfigureAwait(false);
+                if (cached is null)
+                {
+                    fetchFailed = true;
+                    decision = RotationDecider.Decide(reason, _settings.IsRandomMode, null, _state, candidates, intervalDue, _random);
+                }
+                else
+                {
+                    path = Path.GetFullPath(Path.Combine(_cache.CacheDir, cached.File));
+                    id = decision.Entry!.Id;
+                }
             }
 
-            result = apply.Ok ? TickResult.Applied : TickResult.ApplyFailed;
+            if (decision.Kind is DecisionKind.StepOlder or DecisionKind.Random)
+            {
+                if (ImageId.TryParse(decision.Target!.Id, out id))
+                {
+                    path = Path.GetFullPath(Path.Combine(_cache.CacheDir, decision.Target.File));
+                }
+                else
+                {
+                    Log.Warn($"rotation skipped id={decision.Target.Id} reason=bad-id");
+                    decision = new RotationDecision(DecisionKind.NoOp, null, null, "bad-id");
+                }
+            }
+
+            if (decision.Kind == DecisionKind.SeedLastSeen)
+            {
+                _state.LastSeenNewestId = decision.Entry!.Id.Value;
+            }
+
+            // 4. apply — awaitable STA hop; LastSeenNewestId is written only after ApplyStage reports Ok (D-03, T-02-06).
+            if (path is not null)
+            {
+                string applyPath = path;
+                ImageId applyId = id;
+                ApplyResult apply = await _ui.InvokeAsync(
+                    () => ApplyStage.Run(_applier, applyPath, applyId, _cache, _state, _statePath, now), ct).ConfigureAwait(false);
+                if (apply.Ok && decision.Kind == DecisionKind.ApplyNew)
+                {
+                    _state.LastSeenNewestId = applyId.Value;
+                }
+
+                result = apply.Ok ? TickResult.Applied : TickResult.ApplyFailed;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;   // shutdown leaves the schedule alone (RESEARCH Pitfall 9); RunTickAsync maps it to Cancelled
+        }
+        catch (Exception ex)
+        {
+            // A throw (index.json / state.json write failure, an escaping applier exception, an
+            // UnauthorizedAccessException from the download stream) is scheduled by the same D-13 ladder as a failed
+            // fetch — no second ladder, no special case.
+            threw = true;
+            fetchFailed = true;
+            Log.Warn($"tick failed reason={reason} error={ex.Message}", ex);
         }
 
-        // 5. re-arm
+        // 5. re-arm — runs on every non-cancelled path, including a tick that threw.
         DateTimeOffset? retryDue;
         lock (_sync)
         {
             // Next re-arms only when it applied (D-05); Startup/Interval re-arm when the schedule was due (RESEARCH A3,
-            // Pitfall 4) — even after a failed apply, so a COM failure cannot make the heartbeat retry every minute;
-            // Retry never touches the schedule (D-13).
+            // Pitfall 4) — even after a failed OR throwing apply, so neither a COM failure nor an exception can make
+            // the heartbeat retry every minute; Retry never touches the schedule (D-13).
             if ((reason == TickReason.Next && result == TickResult.Applied)
                 || (reason != TickReason.Retry && ScheduleMath.IsDue(now, _state.NextDueUtc)))
             {
@@ -427,11 +453,16 @@ public sealed class RotationService : IDisposable
             retryDue = _retryDueUtc;
         }
 
-        // 6. persist — after ApplyStage's own save, on every path including NoOp and FetchFailed (ROT-07). The retry
-        // time is not part of AppState, so state.json never carries it.
-        _startupTickDone = true;
+        if (threw)
+        {
+            result = TickResult.Failed;   // Failed wins over whatever the ladder branch set (FetchFailed / NoOp)
+        }
+
+        // 6. persist — after ApplyStage's own save, on every path including NoOp, FetchFailed and Failed (ROT-07). The
+        // retry time is not part of AppState, so state.json never carries it. decision is null only when the throw
+        // preceded step 2, hence the "-" tokens.
         TrySaveState();
-        Log.Info($"tick done reason={reason} result={result} decision={decision.Kind} why={decision.Why} next={_state.NextDueUtc?.ToString("O") ?? "-"} retry={retryDue?.ToString("O") ?? "-"}");
+        Log.Info($"tick done reason={reason} result={result} decision={decision?.Kind.ToString() ?? "-"} why={decision?.Why ?? "-"} next={_state.NextDueUtc?.ToString("O") ?? "-"} retry={retryDue?.ToString("O") ?? "-"}");
         return result;
     }
 
