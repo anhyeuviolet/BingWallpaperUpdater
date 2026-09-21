@@ -1,9 +1,11 @@
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.Versioning;
+using BingWallpaperUpdater.Core.Autostart;
 using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Io;
 using BingWallpaperUpdater.Core.Model;
+using BingWallpaperUpdater.Windows.Autostart;
 
 namespace BingWallpaperUpdater.App;
 
@@ -20,8 +22,8 @@ internal static class Program
     /// </summary>
     private const string ShowEventName = @"Local\BingWallpaperUpdater.Show";
 
-    /// <summary>Autostart flag written into the HKCU Run value by Phase 3 (D-12); matched case-insensitively, no value.</summary>
-    private const string StartupFlag = "--startup";
+    /// <summary>Autostart flag in the HKCU Run value (D-12, INST-02); the parser and the producer share one literal. Matched case-insensitively, no value.</summary>
+    private const string StartupFlag = AutostartCommand.Flag;
 
     [STAThread]
     private static int Main(string[] args)
@@ -52,6 +54,15 @@ internal static class Program
         // Settings and the UI culture come before the first WinForms control (Pitfall 4): the tray menu is built in
         // the context constructor and must already read the right resource set.
         Settings settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
+
+        // INST-02: when autostart is wanted, refresh the quoted absolute-path Run value on every start so an upgrade
+        // or a moved folder self-heals. Deliberately leaves StartupApproved alone — a "Disabled" the user set in
+        // Task Manager wins over a manual launch (RESEARCH Pitfall 9); only the Settings checkbox writes it.
+        if (settings.Autostart && Environment.ProcessPath is { Length: > 0 } exe)
+        {
+            RegistryAutostartManager.RewriteRunValue(exe);
+        }
+
         UiCulture.Apply(settings.Language);
 
         ApplicationConfiguration.Initialize();
