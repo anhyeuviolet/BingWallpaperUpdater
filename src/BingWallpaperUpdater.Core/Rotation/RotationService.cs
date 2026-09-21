@@ -165,7 +165,7 @@ public sealed class RotationService : IDisposable
         {
             return await TickCoreAsync(reason, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             return TickResult.Cancelled;
         }
@@ -439,7 +439,7 @@ public sealed class RotationService : IDisposable
                 result = apply.Ok ? TickResult.Applied : TickResult.ApplyFailed;
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;   // shutdown leaves the schedule alone (RESEARCH Pitfall 9); RunTickAsync maps it to Cancelled
         }
@@ -447,7 +447,9 @@ public sealed class RotationService : IDisposable
         {
             // A throw (index.json / state.json write failure, an escaping applier exception, an
             // UnauthorizedAccessException from the download stream) is scheduled by the same D-13 ladder as a failed
-            // fetch — no second ladder, no special case.
+            // fetch — no second ladder, no special case. That includes a TaskCanceledException that is NOT the tick's
+            // own token (HttpClient.Timeout, Task.WaitAsync(TimeSpan), a linked-CTS timeout): only ct decides what
+            // counts as cancellation, otherwise such a throw would skip the re-arm and reopen the CR-01 loop (WR-04).
             threw = true;
             fetchFailed = true;
             Log.Warn($"tick failed reason={reason} error={ex.Message}", ex);

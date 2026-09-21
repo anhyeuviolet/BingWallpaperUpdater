@@ -1384,6 +1384,50 @@ public sealed class RotationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Tick_ApplyThrowsNonTokenCancellation_IsFailedNotCancelled()
+    {
+        // WR-04: a TaskCanceledException that is not the tick's own token (HttpClient.Timeout, Task.WaitAsync(TimeSpan),
+        // a linked-CTS timeout) is a failure like any other throw — re-arm, ladder, save — never a Cancelled that leaves
+        // NextDueUtc in the past for the heartbeat to re-dispatch every minute.
+        Harness h = Build(Newest(), new AppState());
+        h.Applier.ThrowNext = new TaskCanceledException("simulated timeout");
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.Equal(TickResult.Failed, result);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Contains("tick failed reason=Startup error=simulated timeout", LogText());
+        Assert.Contains("tick done reason=Startup result=Failed decision=ApplyNew why=new", LogText());
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Equal(T0 + Interval, SavedState()!.NextDueUtc);
+        Assert.Equal(1, h.Service.FailureStage);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+        Assert.Null(h.State.LastSeenNewestId);
+    }
+
+    [Fact]
+    public async Task Tick_GatewayTimeoutCancellation_IsFetchFailedNotCancelled()
+    {
+        // Pins the filtering the lower layers do today (HttpGateway / RetryPolicy / CatalogService turn a timeout-flavoured
+        // TaskCanceledException into a failed source before it reaches the tick); should that ever move, the WR-04
+        // `when (ct.IsCancellationRequested)` clauses still keep the tick on the failure path with its tail intact.
+        ImageCache cache = SeedCache([Cached(NewestId, "2026-09-20")], applied: NewestId);
+        var timeouts = new FakeHttpHandler(FakeHttpHandler.Throw(new TaskCanceledException("simulated timeout")));
+        Harness h = Build(Newest(), SeenState(dueInMinutes: null), cache, timeouts);
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.NotEqual(TickResult.Cancelled, result);
+        Assert.True(result is TickResult.FetchFailed or TickResult.Failed, result.ToString());
+        Assert.Equal(1, LogCount("tick done reason=Startup"));   // the re-arm / ladder / save tail ran
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Equal(T0 + Interval, SavedState()!.NextDueUtc);
+        Assert.Equal(1, h.Service.FailureStage);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+        Assert.Equal(0, h.Applier.Calls);
+    }
+
+    [Fact]
     public async Task Tick_CancelledMidApply_ReturnsCancelled_LeavesScheduleAlone()
     {
         // The rethrow clause: cancellation is not a failure. A tick treated as Failed would have re-armed to T0 + 30 min.
