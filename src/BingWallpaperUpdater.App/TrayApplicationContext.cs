@@ -31,8 +31,9 @@ namespace BingWallpaperUpdater.App;
 /// turns <c>PBT_APMRESUMEAUTOMATIC</c> / display-on into <see cref="RotationService.Nudge"/> (8 s debounce), and the
 /// secondary bridges map <see cref="SystemEvents.TimeChanged"/> to <see cref="RotationService.OnClockChanged"/>,
 /// <see cref="SystemEvents.PowerModeChanged"/> (Resume) to a nudge, <see cref="NetworkChange.NetworkAvailabilityChanged"/>
-/// to <see cref="RotationService.OnNetworkAvailable"/>, and <see cref="SystemEvents.DisplaySettingsChanged"/> to a log
-/// line (per-monitor re-apply is Plan 03-04). Those handlers run on system-events / thread-pool threads and touch
+/// to <see cref="RotationService.OnNetworkAvailable"/>, and <see cref="SystemEvents.DisplaySettingsChanged"/> to
+/// <see cref="RotationService.OnDisplayChanged"/> (a 3 s debounce, then a gated per-monitor re-apply only when the
+/// attached set changed — WALL-03; never a tick). Those handlers run on system-events / thread-pool threads and touch
 /// nothing but the thread-safe service methods and <see cref="Log"/>; the Show-event wait posts to the UI thread.
 /// Every exit path (Exit menu, thread/unhandled exception, session ending) funnels through <see cref="Shutdown"/>,
 /// which logs once and disposes in a fixed order: unsubscribe the static events and the Show wait, cancel the token,
@@ -152,7 +153,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _timeChanged = (_, _) => _rotation.OnClockChanged();                                          // D-07 clamp + nudge
         _powerModeChanged = (_, e) => { if (e.Mode == PowerModes.Resume) _rotation.Nudge("power-mode-changed"); };   // secondary only (dotnet/runtime #123773)
         _networkChanged = (_, e) => { if (e.IsAvailable) _rotation.OnNetworkAvailable(); };            // ends a retry wait early
-        _displayChanged = (_, _) => Log.Info("display settings changed");                             // log only; WALL-03 is Plan 03-04
+        _displayChanged = (_, _) => _rotation.OnDisplayChanged();                                     // debounced per-monitor re-apply (WALL-03)
         SystemEvents.TimeChanged += _timeChanged;
         SystemEvents.PowerModeChanged += _powerModeChanged;
         NetworkChange.NetworkAvailabilityChanged += _networkChanged;

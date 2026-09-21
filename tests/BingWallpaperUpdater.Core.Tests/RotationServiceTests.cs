@@ -1857,4 +1857,229 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal([MiddleId, OldestId], h.Cache.Index.Applied);
         Assert.Equal(MiddleId, h.State.CurrentImageId);
     }
+
+    // ---- Plan 03-04 Task 2: dock/undock re-apply (debounced, gated, attached-set aware) and mode switch ------
+
+    /// <summary>Per-monitor harness that has already applied over two monitors: one Newest download plus two seeded older images.</summary>
+    private async Task<Harness> PerMonitorAppliedAsync()
+    {
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17", 60), Cached(OldestId, "2026-09-14", 0)]);
+        Harness h = Build(PerMonitor(), new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        return h;
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_PerMonitor_AttachedSetChanged_ReappliesOnceAfterDebounce()
+    {
+        Harness h = await PerMonitorAppliedAsync();
+        int requestsBefore = h.Http.Requests.Count;
+        DateTimeOffset? nextDueBefore = h.Service.NextDueUtc;
+        DateTimeOffset? lastAppliedBefore = h.State.LastAppliedUtc;
+
+        h.Applier.Monitors.Add(ThirdMonitor);   // docked a third display
+        h.Service.OnDisplayChanged();
+        _time.Advance(TimeSpan.FromMilliseconds(300));
+        h.Service.OnDisplayChanged();
+        _time.Advance(TimeSpan.FromMilliseconds(300));
+        h.Service.OnDisplayChanged();            // three signals within a second: one debounce window
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(2, h.Applier.PerMonitorCalls.Count);
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> reapply = h.Applier.PerMonitorCalls[1];
+        Assert.Equal(3, reapply.Count);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", reapply[0].AbsolutePath);   // the current image stays primary
+        Assert.Contains(MiddleId, reapply[1].AbsolutePath);
+        Assert.Contains(OldestId, reapply[2].AbsolutePath);
+        Assert.Equal([NewestId, MiddleId, OldestId], h.Cache.Index.Applied);
+        Assert.Equal(1, LogCount("reapply reason=display monitors=3 result=Applied"));
+        Assert.Equal(3, LogCount("display changed"));
+        Assert.Equal(requestsBefore, h.Http.Requests.Count);   // no fetch on a re-apply
+        Assert.Equal(nextDueBefore, h.Service.NextDueUtc);       // no schedule change
+        Assert.Equal(lastAppliedBefore, h.State.LastAppliedUtc); // a re-apply is not a rotation
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.Equal(0, LogCount("tick reason=Interval"));
+
+        // Undock it again: the set differs from the last apply -> one more re-apply over two monitors.
+        h.Applier.Monitors.Remove(ThirdMonitor);
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+        Assert.Equal(3, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(2, h.Applier.PerMonitorCalls[2].Count);
+        Assert.Equal(1, LogCount("reapply reason=display monitors=2 result=Applied"));
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_UnchangedSet_Skips()
+    {
+        Harness h = await PerMonitorAppliedAsync();
+
+        h.Service.OnDisplayChanged();            // a DPI / resolution change: same two device paths
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=unchanged"));
+        Assert.Equal(0, LogCount("reapply reason=display"));
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_SameMode_Skips()
+    {
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(Newest(), new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+        Assert.Equal(1, h.Applier.Calls);
+
+        h.Applier.Monitors.Add(ThirdMonitor);
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Empty(h.Applier.PerMonitorCalls);
+        Assert.Equal(0, h.Applier.MonitorEnumerations);
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=same-mode"));
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_WhileTickRunning_Skips()
+    {
+        var dispatcher = new BlockingUiDispatcher();
+        Harness h = Build(PerMonitor(), new AppState(), applier: TwoMonitorApplier(), dispatcher: dispatcher);
+        Task<TickResult> tick = h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(h.Service.IsTickRunning);
+
+        h.Service.OnDisplayChanged();
+        _time.Advance(TimeSpan.FromSeconds(3));   // the debounce fires while the tick still holds the gate
+
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=busy"));
+        Assert.Equal(0, LogCount("reapply reason=display"));
+
+        dispatcher.Release();
+        Assert.Equal(TickResult.Applied, await tick.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Single(h.Applier.PerMonitorCalls);   // the tick's own apply; the skipped re-apply was never queued
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_BeforeDebounce_DoesNothing()
+    {
+        Harness h = await PerMonitorAppliedAsync();
+        h.Applier.Monitors.Add(ThirdMonitor);
+
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(2));
+
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(0, LogCount("reapply"));
+
+        await AdvanceAsync(h, TimeSpan.FromSeconds(1));   // the 3 s window closes
+        Assert.Equal(2, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(1, LogCount("reapply reason=display monitors=3 result=Applied"));
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_NothingAppliedYet_SkipsNoCurrent()
+    {
+        Harness h = Build(PerMonitor(), new AppState(), fake: Offline(), applier: TwoMonitorApplier());
+        await StartAsync(h);
+        Assert.Null(h.State.CurrentImageId);
+
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=no-current"));
+        Assert.Equal(0, h.Applier.Calls);
+    }
+
+    [Fact]
+    public async Task ApplySettings_MonitorModeToPerMonitor_ReappliesImmediately()
+    {
+        Settings settings = Newest();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(settings, new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal([NewestId], h.Cache.Index.Applied);
+        int requestsBefore = h.Http.Requests.Count;
+
+        settings.MonitorMode = Settings.PerMonitorMode;
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> call = Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(2, call.Count);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", call[0].AbsolutePath);
+        Assert.Contains(MiddleId, call[1].AbsolutePath);
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.Equal(requestsBefore, h.Http.Requests.Count);
+        string log = LogText();
+        Assert.Contains("reapply reason=settings monitors=2 result=Applied", log);
+        Assert.Contains("settings applied interval=30 mode=newest resolution=UHD market=en-US monitors=perMonitor", log);
+    }
+
+    [Fact]
+    public async Task ApplySettings_MonitorModeBackToSame_ReappliesSingle()
+    {
+        Settings settings = PerMonitor();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(settings, new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(2, h.Cache.Index.Applied.Count);
+
+        settings.MonitorMode = Settings.SameMonitorMode;
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+
+        Assert.Equal(2, h.Applier.Calls);                       // +1 through Apply (NULL monitor = all)
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", h.Applier.LastPath!);
+        Assert.Equal([NewestId], h.Cache.Index.Applied);
+        Assert.Equal(1, LogCount("reapply reason=settings monitors=2 result=Applied"));
+
+        // Back again: the switch is honoured in both directions, every time.
+        settings.MonitorMode = Settings.PerMonitorMode;
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+        Assert.Equal(2, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(2, LogCount("reapply reason=settings monitors=2 result=Applied"));
+    }
+
+    [Fact]
+    public async Task ApplySettings_SameMonitorMode_NoReapply()
+    {
+        Settings settings = PerMonitor();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(settings, new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+
+        settings.IntervalMinutes = 60;           // an interval-only change
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(0, LogCount("reapply"));
+        Assert.Contains("settings applied interval=60", LogText());
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_AfterDispose_IsIgnored()
+    {
+        Harness h = await PerMonitorAppliedAsync();
+        h.Applier.Monitors.Add(ThirdMonitor);
+        h.Service.Dispose();
+
+        h.Service.OnDisplayChanged();
+        _time.Advance(TimeSpan.FromSeconds(3));
+
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(0, LogCount("display changed"));
+        Assert.Equal(0, LogCount("reapply"));
+    }
 }

@@ -15,6 +15,12 @@ public static class ScheduleMath
     /// <summary>Delay applied by <c>Nudge</c> before the next heartbeat check after a resume/clock/network signal (D-10, within 5-10 s).</summary>
     public static readonly TimeSpan ResumeDebounce = TimeSpan.FromSeconds(8);
 
+    /// <summary>
+    /// Delay between a <c>DisplaySettingsChanged</c> signal and the per-monitor re-apply check (WALL-03): the event
+    /// fires several times per dock/undock and also for DPI / resolution changes, so a burst collapses into one check.
+    /// </summary>
+    public static readonly TimeSpan DisplayChangeDebounce = TimeSpan.FromSeconds(3);
+
     /// <summary>An interval change never re-arms closer than this to <c>now</c> (D-07).</summary>
     public static readonly TimeSpan MinLeadAfterIntervalChange = TimeSpan.FromSeconds(5);
 

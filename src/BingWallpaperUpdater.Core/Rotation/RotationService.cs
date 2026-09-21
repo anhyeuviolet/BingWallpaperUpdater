@@ -40,6 +40,7 @@ public sealed class RotationService : IDisposable
     private readonly object _sync = new();
 
     private ITimer? _heartbeat;
+    private ITimer? _displayTimer;           // one-shot DisplayChangeDebounce timer (WALL-03); created lazily under _sync
 
     // The retry ladder (D-13) lives in memory only — never in AppState / state.json — so a restart begins again at
     // 5 min and the persisted NextDueUtc always means the schedule, never a backoff. Both guarded by _sync.
@@ -48,6 +49,7 @@ public sealed class RotationService : IDisposable
     private int _appliedIntervalMinutes;     // the interval the current NextDueUtc was computed with (ApplySettings, D-07)
     private LastErrorKind _lastError;        // what the last tick left for the window's last-error line (UI-04); guarded by _sync
     private string[] _lastAttachedSet = [];  // sorted device paths of the monitors the last apply set (WALL-03); UI thread only, never persisted
+    private string _appliedMonitorMode;      // the MonitorMode the desktop currently reflects; ApplySettings re-applies when the setting differs
     private bool _startupTickDone;
     private volatile bool _disposed;
     private CancellationToken _ct;
@@ -93,6 +95,7 @@ public sealed class RotationService : IDisposable
         _time = time ?? TimeProvider.System;
         _random = random ?? Random.Shared;
         _appliedIntervalMinutes = settings.IntervalMinutes;
+        _appliedMonitorMode = settings.MonitorMode;
     }
 
     /// <summary>
@@ -302,9 +305,48 @@ public sealed class RotationService : IDisposable
         }
 
         TrySaveState();
+
+        // A monitor-mode switch is visible within seconds, not at the next tick (criterion 2 "applies immediately"):
+        // per-monitor -> the plan over the current image; same -> the current image on every monitor. Forced, so the
+        // attached-set comparison does not suppress it; the gate still wins when a tick is in flight.
+        if (!string.Equals(_settings.MonitorMode, _appliedMonitorMode, StringComparison.Ordinal))
+        {
+            _appliedMonitorMode = _settings.MonitorMode;
+            _ = RunReapplyAsync("settings", force: true);
+        }
+
         Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} resolution={_settings.Resolution} market={_settings.Market} monitors={_settings.MonitorMode} language={_settings.Language} next={ReadNextDue()?.ToString("O") ?? "-"}");
         Nudge("settings");
         RaiseStateChanged();
+    }
+
+    /// <summary>
+    /// Any thread (the tray's <c>SystemEvents.DisplaySettingsChanged</c> bridge): arms — or re-arms — the one-shot
+    /// <see cref="ScheduleMath.DisplayChangeDebounce"/> timer on the injected clock, so a dock/undock burst (and the
+    /// DPI / resolution changes that raise the same event) collapses into one re-apply check (WALL-03, T-03-17).
+    /// Never runs a tick and never touches the schedule.
+    /// </summary>
+    public void OnDisplayChanged()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        Log.Info("display changed");
+        try
+        {
+            lock (_sync)
+            {
+                _displayTimer ??= _time.CreateTimer(_ => OnDisplayDebounce(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            }
+
+            _displayTimer.Change(ScheduleMath.DisplayChangeDebounce, Timeout.InfiniteTimeSpan);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Dispose raced a display signal (IN-01); nothing left to re-apply.
+        }
     }
 
     /// <summary>
@@ -351,6 +393,8 @@ public sealed class RotationService : IDisposable
         _disposed = true;
         _heartbeat?.Dispose();
         _heartbeat = null;
+        _displayTimer?.Dispose();
+        _displayTimer = null;
     }
 
     // ---- heartbeat ------------------------------------------------------------------------------------
@@ -501,7 +545,7 @@ public sealed class RotationService : IDisposable
                     // image); monitors are enumerated inside the STA hop, at apply time, never earlier or persisted.
                     IReadOnlyList<CachedImage> planCandidates = RotationDecider.Candidates(_cache.Index.Images, resolution, FileExists);
                     apply = await _ui.InvokeAsync(
-                        () => ApplyPlan(planCandidates, applyId, applyPath, now), ct).ConfigureAwait(false);
+                        () => ApplyPlan(_applier.GetAttachedMonitors(), planCandidates, applyId, applyPath, now), ct).ConfigureAwait(false);
                 }
                 else
                 {
@@ -613,15 +657,14 @@ public sealed class RotationService : IDisposable
     private bool FileExists(CachedImage image) => File.Exists(Path.Combine(_cache.CacheDir, image.File));
 
     /// <summary>
-    /// UI (STA) thread only: enumerates the attached monitors NOW, builds the deterministic <see cref="MonitorPlan"/>
-    /// (primary first, next older neighbours, same-on-all until enough are cached) and runs
+    /// UI (STA) thread only: over the monitors enumerated NOW by the caller, builds the deterministic
+    /// <see cref="MonitorPlan"/> (primary first, next older neighbours, same-on-all until enough are cached) and runs
     /// <see cref="ApplyStage.RunPerMonitor"/>. With no enumerable monitor the plan has one entry and the stage
     /// degrades to the NULL-monitor apply. Records the attached device-path set in memory (never persisted) so a
     /// display change can tell "something attached or detached" from a mere DPI / resolution change.
     /// </summary>
-    private ApplyResult ApplyPlan(IReadOnlyList<CachedImage> candidates, ImageId primaryId, string primaryPath, DateTimeOffset now)
+    private ApplyResult ApplyPlan(IReadOnlyList<MonitorHandle> monitors, IReadOnlyList<CachedImage> candidates, ImageId primaryId, string primaryPath, DateTimeOffset appliedUtc)
     {
-        IReadOnlyList<MonitorHandle> monitors = _applier.GetAttachedMonitors();
         IReadOnlyList<string> ids = MonitorPlan.Build(candidates, primaryId.Value, Math.Max(1, monitors.Count));
 
         var plan = new List<(ImageId Id, string AbsolutePath)>(ids.Count);
@@ -646,7 +689,7 @@ public sealed class RotationService : IDisposable
             plan.Add((parsed, Path.GetFullPath(Path.Combine(_cache.CacheDir, candidate.File))));
         }
 
-        ApplyResult result = ApplyStage.RunPerMonitor(_applier, monitors, plan, _cache, _state, _statePath, now);
+        ApplyResult result = ApplyStage.RunPerMonitor(_applier, monitors, plan, _cache, _state, _statePath, appliedUtc);
         _lastAttachedSet = DeviceSet(monitors);
         return result;
     }
@@ -654,6 +697,112 @@ public sealed class RotationService : IDisposable
     /// <summary>The attached monitors as a sorted device-path array (order-independent comparison of two enumerations).</summary>
     private static string[] DeviceSet(IReadOnlyList<MonitorHandle> monitors) =>
         monitors.Select(m => m.DevicePath).OrderBy(p => p, StringComparer.Ordinal).ToArray();
+
+    // ---- re-apply (WALL-03 dock/undock, mode switch) ----------------------------------------------------
+
+    private void OnDisplayDebounce()
+    {
+        // Timer callback on a thread-pool thread: nothing may escape (WR-02). RunReapplyAsync never throws.
+        try
+        {
+            _ = RunReapplyAsync("display", force: false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("display debounce failed", ex);
+        }
+    }
+
+    /// <summary>
+    /// Re-applies what is already current — no fetch, no decision, no schedule change, no retry ladder — through the
+    /// same single-flight gate as ticks. <paramref name="force"/> is false for a display change (per-monitor mode only,
+    /// and only when the attached device-path set differs from the one the last apply recorded, so a DPI / resolution
+    /// change re-sets nothing) and true for a monitor-mode switch (either direction, whatever the set). The resolution
+    /// comes from the same <see cref="EffectiveResolution"/> helper as the tick, so "Auto" can never leak in here.
+    /// <see cref="AppState.LastAppliedUtc"/> is kept: a re-apply is not a rotation and must not move the baseline an
+    /// interval change is computed from. Every outcome is one log line: <c>reapply reason=&lt;r&gt; monitors=&lt;n&gt;
+    /// result=&lt;Applied|Failed&gt;</c>, <c>reapply skipped reason=&lt;r&gt; cause=&lt;unchanged|same-mode|busy|no-current&gt;</c>
+    /// or <c>reapply failed reason=&lt;r&gt; error=</c>; it is never re-armed.
+    /// </summary>
+    private async Task RunReapplyAsync(string reason, bool force)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (!force && !_settings.IsPerMonitor)
+        {
+            Log.Info($"reapply skipped reason={reason} cause=same-mode");
+            return;
+        }
+
+        if (!_gate.Wait(0, CancellationToken.None))
+        {
+            Log.Info($"reapply skipped reason={reason} cause=busy");   // the running tick applies the current plan anyway
+            return;
+        }
+
+        try
+        {
+            string? currentId;
+            DateTimeOffset appliedUtc;
+            lock (_sync)
+            {
+                currentId = _state.CurrentImageId;
+                appliedUtc = _state.LastAppliedUtc ?? _time.GetUtcNow();
+            }
+
+            string resolution = EffectiveResolution(MonitorSizes());
+            IReadOnlyList<CachedImage> candidates = RotationDecider.Candidates(_cache.Index.Images, resolution, FileExists);
+            CachedImage? current = currentId is null
+                ? null
+                : candidates.FirstOrDefault(c => string.Equals(c.Id, currentId, StringComparison.Ordinal));
+            if (current is null || !ImageId.TryParse(current.Id, out ImageId primaryId))
+            {
+                Log.Info($"reapply skipped reason={reason} cause=no-current");
+                return;
+            }
+
+            string primaryPath = Path.GetFullPath(Path.Combine(_cache.CacheDir, current.File));
+            (ApplyResult? apply, int monitorCount) = await _ui.InvokeAsync(() =>
+            {
+                IReadOnlyList<MonitorHandle> monitors = _applier.GetAttachedMonitors();
+                string[] set = DeviceSet(monitors);
+                if (!force && set.SequenceEqual(_lastAttachedSet, StringComparer.Ordinal))
+                {
+                    Log.Info($"reapply skipped reason={reason} cause=unchanged");
+                    return ((ApplyResult?)null, monitors.Count);
+                }
+
+                ApplyResult result;
+                if (_settings.IsPerMonitor)
+                {
+                    result = ApplyPlan(monitors, candidates, primaryId, primaryPath, appliedUtc);
+                }
+                else
+                {
+                    result = ApplyStage.Run(_applier, primaryPath, primaryId, _cache, _state, _statePath, appliedUtc);
+                    _lastAttachedSet = set;
+                }
+
+                return (result, monitors.Count);
+            }, _ct).ConfigureAwait(false);
+
+            if (apply is not null)
+            {
+                Log.Info($"reapply reason={reason} monitors={monitorCount} result={(apply.Ok ? "Applied" : "Failed")}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"reapply failed reason={reason} error={ex.Message}", ex);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
 
     /// <summary>
     /// The attached monitors from the <see cref="IMonitorLayout"/> port, or an empty list when the adapter throws
