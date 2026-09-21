@@ -48,13 +48,19 @@ internal sealed class BlockingUiDispatcher : IUiDispatcher
     }
 }
 
-/// <summary>Counting <see cref="IWallpaperApplier"/>; succeeds unless <see cref="FailNext"/> is set for the next call.</summary>
+/// <summary>
+/// Counting <see cref="IWallpaperApplier"/>; succeeds unless <see cref="FailNext"/> (a failed <see cref="ApplyResult"/>)
+/// or <see cref="ThrowNext"/> (an escaping exception, the CR-01 path) is armed for the next call. Both are one-shot.
+/// </summary>
 internal sealed class FakeApplier : IWallpaperApplier
 {
     public int Calls { get; private set; }
     public string? LastPath { get; private set; }
     public List<string> Paths { get; } = [];
     public bool FailNext { get; set; }
+
+    /// <summary>One-shot: the next <see cref="Apply"/> still counts the call and records the path, then throws this and clears it.</summary>
+    public Exception? ThrowNext { get; set; }
 
     public void Reset()
     {
@@ -68,6 +74,12 @@ internal sealed class FakeApplier : IWallpaperApplier
         Calls++;
         LastPath = absolutePath;
         Paths.Add(absolutePath);
+        if (ThrowNext is { } pending)
+        {
+            ThrowNext = null;
+            throw pending;
+        }
+
         if (FailNext)
         {
             FailNext = false;

@@ -1034,4 +1034,68 @@ public sealed class RotationServiceTests : IDisposable
         TimeSpan lead = h.Service.NextDueUtc!.Value - now;
         Assert.True(lead <= settings.Interval, $"NextDueUtc - now = {lead} exceeds the interval {settings.Interval} at {now:O}");
     }
+
+    // ---- Plan 02-05 (gap G-01 / CR-01): the exception path of a tick ----------------------------------
+
+    /// <summary>
+    /// Three images cached with the middle one on the desktop and the catalog already seen: the Startup tick is a
+    /// not-due NoOp. The test then pretends the catalog moved since the last look (smoke S8's textual-fixture trick)
+    /// so the interval-due tick decides ApplyNew with a cache hit on the newest image.
+    /// </summary>
+    private async Task<Harness> StartNotDueWithMiddleApplied_ThenCatalogMoved(ImageCache? cache = null)
+    {
+        cache ??= SeedCache(ThreeCached(), applied: MiddleId);
+        var state = new AppState { CurrentImageId = MiddleId, LastSeenNewestId = NewestId, NextDueUtc = T0 + Interval };
+        Harness h = Build(Newest(), state, cache);
+
+        await StartAsync(h);
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Contains("tick done reason=Startup result=NoOp decision=NoOp why=not-due", LogText());
+
+        h.State.LastSeenNewestId = MiddleId;   // no tick is running; the fake clock only fires inside Advance
+        return h;
+    }
+
+    [Fact]
+    public async Task Interval_ApplyThrows_RearmsAndDoesNotRetryEveryMinute()
+    {
+        Harness h = await StartNotDueWithMiddleApplied_ThenCatalogMoved();
+        h.Applier.ThrowNext = new InvalidOperationException("simulated COM failure");
+
+        await AdvanceAsync(h, Interval);   // the interval-due tick at T0 + 30 min: cache hit on NewestId, applier throws
+
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Contains("AlphornBavaria", h.Applier.LastPath!, StringComparison.Ordinal);
+        Assert.Contains("tick failed reason=Interval error=simulated COM failure", LogText());
+        Assert.Contains("tick done reason=Interval result=Failed decision=ApplyNew why=new", LogText());
+        Assert.Equal(MiddleId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(MiddleId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(new[] { MiddleId }, h.Cache.Index.Applied);          // ApplyStage rolled the record back before rethrowing
+        Assert.Equal(now + Interval, h.Service.NextDueUtc);                 // re-armed despite the throw (G-01)
+        Assert.Equal(now + Interval, SavedState()!.NextDueUtc);             // and the tail persisted it
+        Assert.Equal(1, h.Service.FailureStage);                            // a throw takes the same ladder as a failed fetch (D-13)
+        Assert.Equal(now + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+        Assert.Contains($"retry scheduled stage=1 at={(now + TimeSpan.FromMinutes(5)):O}", LogText());
+        AssertStateFileHasNoRetry();
+
+        int requests = h.Http.Requests.Count;
+        await AdvanceAsync(h, TimeSpan.FromMinutes(4));   // four beats inside the retry lead: no tick, no network
+
+        Assert.Equal(2, LogCount("tick reason="));       // Startup + the one Interval
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(requests, h.Http.Requests.Count);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(1));   // the ladder-due beat: exactly one Retry, the one-shot throw is spent
+
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Contains("tick done reason=Retry result=Applied decision=ApplyNew why=new", LogText());
+        Assert.Equal(0, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+        Assert.Equal(T0 + Interval + Interval, h.Service.NextDueUtc);      // a Retry never re-arms
+    }
 }
