@@ -73,7 +73,9 @@ Stop-App
 if (Test-Path $logPath) { Remove-Item $logPath -Force }
 
 Write-Host 'flushing the DNS client cache (ipconfig /flushdns)'
-$flush = & ipconfig /flushdns 2>&1
+# stdout only: merging stderr (2>&1) under $ErrorActionPreference = 'Stop' turns any native stderr line into a
+# terminating NativeCommandError in Windows PowerShell 5.1 (same rule as smoke-verify.ps1's probe call).
+$flush = @(& ipconfig /flushdns | ForEach-Object { [string]$_ })
 Write-Host "  $($flush | Where-Object { $_ -match '\S' } | Select-Object -Last 1)"
 $before = @(Get-DnsSnapshot)
 Write-Host "  dns entries before the run: $($before.Count)"
