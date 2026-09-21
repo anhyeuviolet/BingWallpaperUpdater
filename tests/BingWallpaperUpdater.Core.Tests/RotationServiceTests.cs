@@ -6,6 +6,7 @@ using BingWallpaperUpdater.Core.Io;
 using BingWallpaperUpdater.Core.Json;
 using BingWallpaperUpdater.Core.Model;
 using BingWallpaperUpdater.Core.Net;
+using BingWallpaperUpdater.Core.Ports;
 using BingWallpaperUpdater.Core.Rotation;
 using BingWallpaperUpdater.Core.Scheduling;
 using Microsoft.Extensions.Time.Testing;
@@ -1746,5 +1747,114 @@ public sealed class RotationServiceTests : IDisposable
         await h.Service.RunTickAsync(TickReason.Next, CancellationToken.None);
 
         Assert.Contains("tick reason=Next mode=newest interval=30 resolution=UHD auto=2560x1440", LogText());
+    }
+
+    // ---- Plan 03-04 Task 1: per-monitor apply (WALL-03) ----------------------------------------------
+
+    private static readonly MonitorHandle LeftMonitor = new(@"\\?\DISPLAY#HKC0000#5&29c4b990&0&UID4355#{guid}", 1920, 1080, 0, 0);
+    private static readonly MonitorHandle RightMonitor = new(@"\\?\DISPLAY#HKC0000#5&29c4b990&0&UID4356#{guid}", 1920, 1080, 1920, 0);
+    private static readonly MonitorHandle ThirdMonitor = new(@"\\?\DISPLAY#DOCK0001#7&1a2b3c4d&0&UID9#{guid}", 2560, 1440, 3840, 0);
+
+    private static Settings PerMonitor() => new() { IntervalMinutes = 30, Mode = Settings.DefaultMode, MonitorMode = Settings.PerMonitorMode };
+
+    private static FakeApplier TwoMonitorApplier()
+    {
+        var applier = new FakeApplier();
+        applier.Monitors.Add(LeftMonitor);
+        applier.Monitors.Add(RightMonitor);
+        return applier;
+    }
+
+    [Fact]
+    public async Task PerMonitor_TwoMonitorsTwoImages_AppliesDistinctImages()
+    {
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(PerMonitor(), new AppState(), cache, applier: TwoMonitorApplier());
+
+        await StartAsync(h);
+
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> call = Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(1, h.Applier.Calls);   // exactly one apply of any kind
+        Assert.Equal(2, call.Count);
+        Assert.Same(LeftMonitor, call[0].Monitor);
+        Assert.Same(RightMonitor, call[1].Monitor);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", call[0].AbsolutePath);   // downloaded this tick (CacheFileName drops the OHR. prefix)
+        Assert.Contains(MiddleId, call[1].AbsolutePath);                              // the seeded neighbour
+        Assert.NotEqual(call[0].AbsolutePath, call[1].AbsolutePath);
+        Assert.True(File.Exists(call[0].AbsolutePath));
+        Assert.True(File.Exists(call[1].AbsolutePath));
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId);
+
+        string log = LogText();
+        Assert.Contains("apply ok method=fake id=", log);
+        Assert.Contains($" monitors=2 ids={NewestId},{MiddleId} ", log);
+        Assert.Contains("tick done reason=Startup result=Applied decision=ApplyNew why=new", log);
+    }
+
+    [Fact]
+    public async Task PerMonitor_OneCachedImage_SameOnAll()
+    {
+        Harness h = Build(PerMonitor(), new AppState(), applier: TwoMonitorApplier());
+
+        await StartAsync(h);
+
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> call = Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(2, call.Count);
+        Assert.Equal(call[0].AbsolutePath, call[1].AbsolutePath);
+        Assert.Equal([NewestId], h.Cache.Index.Applied);
+        Assert.Contains($" monitors=2 ids={NewestId} ", LogText());
+    }
+
+    [Fact]
+    public async Task PerMonitor_NoAttachedMonitors_FallsBackToSingleApply()
+    {
+        Harness h = Build(PerMonitor(), new AppState());   // FakeApplier.Monitors is empty: no per-monitor support
+
+        await StartAsync(h);
+
+        Assert.Empty(h.Applier.PerMonitorCalls);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(1, h.Applier.MonitorEnumerations);
+        Assert.Equal([NewestId], h.Cache.Index.Applied);
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.Contains($" monitors=0 ids={NewestId} ", LogText());
+    }
+
+    [Fact]
+    public async Task SameMode_NeverCallsApplyPerMonitor()
+    {
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(Newest(), new AppState(), cache, applier: TwoMonitorApplier());
+
+        await StartAsync(h);
+        await h.Service.RunTickAsync(TickReason.Next, CancellationToken.None);   // steps to the older seeded image
+
+        Assert.Empty(h.Applier.PerMonitorCalls);
+        Assert.Equal(0, h.Applier.MonitorEnumerations);
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.Equal(MiddleId, h.State.CurrentImageId);
+        Assert.Single(h.Cache.Index.Applied);
+        Assert.DoesNotContain(" monitors=2 ids=", LogText());
+    }
+
+    /// <summary>Next in per-monitor mode steps the primary to the next older image; the neighbour follows it (deterministic plan).</summary>
+    [Fact]
+    public async Task PerMonitor_Next_StepsPrimary_NeighbourFollows()
+    {
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17", 60), Cached(OldestId, "2026-09-14", 0)]);
+        Harness h = Build(PerMonitor(), new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+
+        await h.Service.RunTickAsync(TickReason.Next, CancellationToken.None);
+
+        Assert.Equal(2, h.Applier.PerMonitorCalls.Count);
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> second = h.Applier.PerMonitorCalls[1];
+        Assert.Contains(MiddleId, second[0].AbsolutePath);
+        Assert.Contains(OldestId, second[1].AbsolutePath);
+        Assert.Equal([MiddleId, OldestId], h.Cache.Index.Applied);
+        Assert.Equal(MiddleId, h.State.CurrentImageId);
     }
 }

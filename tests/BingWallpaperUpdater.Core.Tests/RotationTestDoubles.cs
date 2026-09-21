@@ -72,7 +72,9 @@ internal sealed class BlockingUiDispatcher : IUiDispatcher
 
 /// <summary>
 /// Counting <see cref="IWallpaperApplier"/>; succeeds unless <see cref="FailNext"/> (a failed <see cref="ApplyResult"/>)
-/// or <see cref="ThrowNext"/> (an escaping exception, the CR-01 path) is armed for the next call. Both are one-shot.
+/// or <see cref="ThrowNext"/> (an escaping exception, the CR-01 path) is armed for the next call. Both are one-shot and
+/// apply to <see cref="Apply"/> and <see cref="ApplyPerMonitor"/> alike; <see cref="Calls"/> counts both.
+/// <see cref="Monitors"/> is what <see cref="GetAttachedMonitors"/> returns (a copy) — mutate it mid-test to dock/undock.
 /// </summary>
 internal sealed class FakeApplier : IWallpaperApplier
 {
@@ -80,6 +82,14 @@ internal sealed class FakeApplier : IWallpaperApplier
     public string? LastPath { get; private set; }
     public List<string> Paths { get; } = [];
     public bool FailNext { get; set; }
+
+    /// <summary>The attached monitors the fake enumerates; empty by default (the "no per-monitor support" case).</summary>
+    public List<MonitorHandle> Monitors { get; } = [];
+
+    /// <summary>Every <see cref="ApplyPerMonitor"/> invocation's assignments, in order (including failed / throwing ones).</summary>
+    public List<IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)>> PerMonitorCalls { get; } = [];
+
+    public int MonitorEnumerations { get; private set; }
 
     /// <summary>One-shot: the next <see cref="Apply"/> still counts the call and records the path, then throws this and clears it.</summary>
     public Exception? ThrowNext { get; set; }
@@ -100,6 +110,9 @@ internal sealed class FakeApplier : IWallpaperApplier
         FailNext = false;
         ThrowNext = null;
         ReadBackOverride = null;
+        Monitors.Clear();
+        PerMonitorCalls.Clear();
+        MonitorEnumerations = 0;
     }
 
     public ApplyResult Apply(string absolutePath)
@@ -107,6 +120,27 @@ internal sealed class FakeApplier : IWallpaperApplier
         Calls++;
         LastPath = absolutePath;
         Paths.Add(absolutePath);
+        return Respond(absolutePath);
+    }
+
+    public IReadOnlyList<MonitorHandle> GetAttachedMonitors()
+    {
+        MonitorEnumerations++;
+        return [.. Monitors];
+    }
+
+    public ApplyResult ApplyPerMonitor(IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> assignments)
+    {
+        Calls++;
+        PerMonitorCalls.Add([.. assignments]);
+        string primary = assignments.Count > 0 ? assignments[0].AbsolutePath : string.Empty;
+        LastPath = primary;
+        Paths.Add(primary);
+        return Respond(primary);
+    }
+
+    private ApplyResult Respond(string primaryPath)
+    {
         if (ThrowNext is { } pending)
         {
             ThrowNext = null;
@@ -119,6 +153,6 @@ internal sealed class FakeApplier : IWallpaperApplier
             return new ApplyResult(false, "fake", null, null, "forced failure");
         }
 
-        return new ApplyResult(true, "fake", ReadBackOverride ?? absolutePath, "DWPOS_FILL", null);
+        return new ApplyResult(true, "fake", ReadBackOverride ?? primaryPath, "DWPOS_FILL", null);
     }
 }

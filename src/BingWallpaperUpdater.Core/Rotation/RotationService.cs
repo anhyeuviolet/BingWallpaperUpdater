@@ -47,6 +47,7 @@ public sealed class RotationService : IDisposable
     private int _failureStage;               // 0 after any successful fetch; +1 per failed fetch
     private int _appliedIntervalMinutes;     // the interval the current NextDueUtc was computed with (ApplySettings, D-07)
     private LastErrorKind _lastError;        // what the last tick left for the window's last-error line (UI-04); guarded by _sync
+    private string[] _lastAttachedSet = [];  // sorted device paths of the monitors the last apply set (WALL-03); UI thread only, never persisted
     private bool _startupTickDone;
     private volatile bool _disposed;
     private CancellationToken _ct;
@@ -452,10 +453,7 @@ public sealed class RotationService : IDisposable
             fetchFailed = entry is null;
 
             // 2. decide
-            IReadOnlyList<CachedImage> candidates = RotationDecider.Candidates(
-                _cache.Index.Images,
-                resolution,
-                i => File.Exists(Path.Combine(_cache.CacheDir, i.File)));
+            IReadOnlyList<CachedImage> candidates = RotationDecider.Candidates(_cache.Index.Images, resolution, FileExists);
             decision = RotationDecider.Decide(reason, _settings.IsRandomMode, entry, _state, candidates, intervalDue, _random);
 
             // 3. ensure
@@ -497,8 +495,20 @@ public sealed class RotationService : IDisposable
             {
                 string applyPath = path;
                 ImageId applyId = id;
-                apply = await _ui.InvokeAsync(
-                    () => ApplyStage.Run(_applier, applyPath, applyId, _cache, _state, _statePath, now), ct).ConfigureAwait(false);
+                if (_settings.IsPerMonitor)
+                {
+                    // WALL-03: the candidates are recomputed AFTER the ensure step (it may have just added the new
+                    // image); monitors are enumerated inside the STA hop, at apply time, never earlier or persisted.
+                    IReadOnlyList<CachedImage> planCandidates = RotationDecider.Candidates(_cache.Index.Images, resolution, FileExists);
+                    apply = await _ui.InvokeAsync(
+                        () => ApplyPlan(planCandidates, applyId, applyPath, now), ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    apply = await _ui.InvokeAsync(
+                        () => ApplyStage.Run(_applier, applyPath, applyId, _cache, _state, _statePath, now), ct).ConfigureAwait(false);
+                }
+
                 if (apply.Ok && decision.Kind == DecisionKind.ApplyNew)
                 {
                     _state.LastSeenNewestId = applyId.Value;
@@ -596,6 +606,54 @@ public sealed class RotationService : IDisposable
             return _state.NextDueUtc;
         }
     }
+
+    // ---- per-monitor apply (WALL-03) --------------------------------------------------------------------
+
+    /// <summary>The decider's file predicate: a cache entry is a candidate only while its file is on disk.</summary>
+    private bool FileExists(CachedImage image) => File.Exists(Path.Combine(_cache.CacheDir, image.File));
+
+    /// <summary>
+    /// UI (STA) thread only: enumerates the attached monitors NOW, builds the deterministic <see cref="MonitorPlan"/>
+    /// (primary first, next older neighbours, same-on-all until enough are cached) and runs
+    /// <see cref="ApplyStage.RunPerMonitor"/>. With no enumerable monitor the plan has one entry and the stage
+    /// degrades to the NULL-monitor apply. Records the attached device-path set in memory (never persisted) so a
+    /// display change can tell "something attached or detached" from a mere DPI / resolution change.
+    /// </summary>
+    private ApplyResult ApplyPlan(IReadOnlyList<CachedImage> candidates, ImageId primaryId, string primaryPath, DateTimeOffset now)
+    {
+        IReadOnlyList<MonitorHandle> monitors = _applier.GetAttachedMonitors();
+        IReadOnlyList<string> ids = MonitorPlan.Build(candidates, primaryId.Value, Math.Max(1, monitors.Count));
+
+        var plan = new List<(ImageId Id, string AbsolutePath)>(ids.Count);
+        foreach (string rawId in ids)
+        {
+            if (string.Equals(rawId, primaryId.Value, StringComparison.Ordinal))
+            {
+                plan.Add((primaryId, primaryPath));
+                continue;
+            }
+
+            CachedImage? candidate = candidates.FirstOrDefault(c => string.Equals(c.Id, rawId, StringComparison.Ordinal));
+            if (candidate is null || !ImageId.TryParse(rawId, out ImageId parsed))
+            {
+                // Cannot happen for a plan built from these candidates; a stale index entry with a malformed ID
+                // gets the primary instead of failing the whole apply.
+                Log.Warn($"monitor plan skipped id={rawId} reason=bad-id");
+                plan.Add((primaryId, primaryPath));
+                continue;
+            }
+
+            plan.Add((parsed, Path.GetFullPath(Path.Combine(_cache.CacheDir, candidate.File))));
+        }
+
+        ApplyResult result = ApplyStage.RunPerMonitor(_applier, monitors, plan, _cache, _state, _statePath, now);
+        _lastAttachedSet = DeviceSet(monitors);
+        return result;
+    }
+
+    /// <summary>The attached monitors as a sorted device-path array (order-independent comparison of two enumerations).</summary>
+    private static string[] DeviceSet(IReadOnlyList<MonitorHandle> monitors) =>
+        monitors.Select(m => m.DevicePath).OrderBy(p => p, StringComparer.Ordinal).ToArray();
 
     /// <summary>
     /// The attached monitors from the <see cref="IMonitorLayout"/> port, or an empty list when the adapter throws

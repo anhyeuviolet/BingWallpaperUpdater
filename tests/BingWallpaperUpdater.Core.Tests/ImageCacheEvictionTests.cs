@@ -190,6 +190,47 @@ public sealed class ImageCacheEvictionTests : IDisposable
     }
 
     /// <summary>
+    /// WALL-03 / CACHE-02 invariant (Plan 03-04 add-alongside): every ID in <c>Applied</c> — one per monitor in
+    /// per-monitor mode — is protected, so the eviction skips both applied images and takes the oldest unprotected one.
+    /// </summary>
+    [Fact]
+    public void Add_EleventhImage_TwoAppliedIds_EvictsOldestUnprotected_KeepsBoth()
+    {
+        List<CachedImage> ten = Ascending(10);
+        foreach (CachedImage image in ten)
+        {
+            File.WriteAllBytes(Path.Combine(_dir, image.File), new byte[16]);
+        }
+
+        string indexPath = Path.Combine(_dir, "index.json");
+        var index = new CacheIndex { Applied = ["OHR.Image1_EN-US1", "OHR.Image2_EN-US2"], Images = ten };
+        AtomicJsonFile.Save(indexPath, index, CoreJsonContext.Default.CacheIndex);
+
+        var cache = new ImageCache(_dir, indexPath);
+        cache.Load();
+        CachedImage eleventh = Image(11, 11);
+        File.WriteAllBytes(Path.Combine(_dir, eleventh.File), new byte[16]);
+
+        cache.Add(eleventh);
+
+        Assert.Equal(10, cache.Index.Images.Count);
+        Assert.False(File.Exists(Path.Combine(_dir, "2026-09-01_Image3.jpg")), "the third-oldest image is the oldest unprotected one");
+        Assert.True(File.Exists(Path.Combine(_dir, "2026-09-01_Image1.jpg")), "the first applied image must stay on disk");
+        Assert.True(File.Exists(Path.Combine(_dir, "2026-09-01_Image2.jpg")), "the second applied image must stay on disk");
+        Assert.DoesNotContain(cache.Index.Images, i => i.Id == "OHR.Image3_EN-US3");
+        Assert.Contains(cache.Index.Images, i => i.Id == "OHR.Image1_EN-US1");
+        Assert.Contains(cache.Index.Images, i => i.Id == "OHR.Image2_EN-US2");
+        Assert.Contains(cache.Index.Images, i => i.Id == eleventh.Id);
+
+        CacheIndex? reloaded = AtomicJsonFile.Load(indexPath, CoreJsonContext.Default.CacheIndex);
+        Assert.NotNull(reloaded);
+        Assert.Equal(["OHR.Image1_EN-US1", "OHR.Image2_EN-US2"], reloaded!.Applied);
+        Assert.Contains("evict id=OHR.Image3_EN-US3", LogText());
+        Assert.DoesNotContain("evict id=OHR.Image1_EN-US1", LogText());
+        Assert.DoesNotContain("evict id=OHR.Image2_EN-US2", LogText());
+    }
+
+    /// <summary>
     /// IN-09: the index is saved before any victim file is deleted. When the save fails, the in-memory index is put
     /// back to what index.json still says, every file stays, and the caller sees the exception.
     /// </summary>

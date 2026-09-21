@@ -102,6 +102,8 @@ public sealed class ApplyStageTests : IDisposable
         public List<string>? AppliedWhenCalled { get; private set; }
         public string? PathReceived { get; private set; }
         public int Calls { get; private set; }
+        public int PerMonitorCalls { get; private set; }
+        public IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)>? AssignmentsReceived { get; private set; }
 
         public ApplyResult Apply(string absolutePath)
         {
@@ -110,7 +112,23 @@ public sealed class ApplyStageTests : IDisposable
             AppliedWhenCalled = _appliedOnDisk();
             return _respond(absolutePath);
         }
+
+        public IReadOnlyList<MonitorHandle> GetAttachedMonitors() => [];
+
+        public ApplyResult ApplyPerMonitor(IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> assignments)
+        {
+            PerMonitorCalls++;
+            AssignmentsReceived = assignments;
+            PathReceived = assignments[0].AbsolutePath;
+            AppliedWhenCalled = _appliedOnDisk();
+            return _respond(assignments[0].AbsolutePath);
+        }
     }
+
+    private static readonly MonitorHandle Left = new(@"\\?\DISPLAY#TEST#1&0&UID1#{guid}", 1920, 1080, 0, 0);
+    private static readonly MonitorHandle Right = new(@"\\?\DISPLAY#TEST#1&0&UID2#{guid}", 1920, 1080, 1920, 0);
+
+    private string PreviousPath => Path.Combine(_dir, "2026-09-19_Previous_EN-US1.jpg");
 
     private static ApplyResult Ok(string path) => new(true, "com", path, "DWPOS_FILL", null);
 
@@ -233,5 +251,118 @@ public sealed class ApplyStageTests : IDisposable
         Assert.False(result.Ok);
         Assert.Empty(AppliedOnDisk());
         Assert.Empty(cache.Index.Applied);
+    }
+
+    // ---- RunPerMonitor (WALL-03): the same four steps with N applied IDs -----------------------------------
+
+    [Fact]
+    public void RunPerMonitor_MarksBothIdsBeforeApply()
+    {
+        ImageCache cache = SeededCache();
+        var state = new AppState();
+        var applier = new ProbingApplier(AppliedOnDisk, Ok);
+        List<(ImageId, string)> plan = [(Id(NewId), _imagePath), (Id(PreviousId), PreviousPath)];
+
+        ApplyResult result = ApplyStage.RunPerMonitor(applier, [Left, Right], plan, cache, state, _statePath);
+
+        Assert.True(result.Ok);
+        Assert.Equal(0, applier.Calls);
+        Assert.Equal(1, applier.PerMonitorCalls);
+        Assert.Equal([NewId, PreviousId], applier.AppliedWhenCalled!);   // both persisted BEFORE the desktop changed
+        Assert.Equal([NewId, PreviousId], AppliedOnDisk());
+        Assert.Equal([NewId, PreviousId], cache.Index.Applied);
+        Assert.Equal(2, applier.AssignmentsReceived!.Count);
+        Assert.Same(Left, applier.AssignmentsReceived[0].Monitor);
+        Assert.Equal(_imagePath, applier.AssignmentsReceived[0].AbsolutePath);
+        Assert.Same(Right, applier.AssignmentsReceived[1].Monitor);
+        Assert.Equal(PreviousPath, applier.AssignmentsReceived[1].AbsolutePath);
+        Assert.Equal(NewId, state.CurrentImageId);
+        Assert.NotNull(state.LastAppliedUtc);
+        Assert.Equal(NewId, AtomicJsonFile.Load(_statePath, CoreJsonContext.Default.AppState)!.CurrentImageId);
+    }
+
+    [Fact]
+    public void RunPerMonitor_FailedApply_RestoresPreviousApplied()
+    {
+        ImageCache cache = SeededCache();
+        var state = new AppState { CurrentImageId = PreviousId };
+        var applier = new ProbingApplier(AppliedOnDisk, _ => new ApplyResult(false, "com", null, null, "COMException 0x80004005 shell said no"));
+        List<(ImageId, string)> plan = [(Id(NewId), _imagePath), (Id(PreviousId), PreviousPath)];
+
+        ApplyResult result = ApplyStage.RunPerMonitor(applier, [Left, Right], plan, cache, state, _statePath);
+
+        Assert.False(result.Ok);
+        Assert.Equal([NewId, PreviousId], applier.AppliedWhenCalled!);
+        Assert.Equal([PreviousId], AppliedOnDisk());
+        Assert.Equal([PreviousId], cache.Index.Applied);
+        Assert.Equal(PreviousId, state.CurrentImageId);
+        Assert.False(File.Exists(_statePath));
+        string log = LogText();
+        Assert.Contains("apply failed method=com error=COMException 0x80004005 shell said no", log);
+        Assert.DoesNotContain("apply ok", log);
+
+        // An escaping exception rolls back the same way.
+        var thrower = new ProbingApplier(AppliedOnDisk, _ => throw new InvalidOperationException("adapter bug"));
+        Assert.Throws<InvalidOperationException>(() => ApplyStage.RunPerMonitor(thrower, [Left, Right], plan, cache, state, _statePath));
+        Assert.Equal([PreviousId], AppliedOnDisk());
+        Assert.Equal([PreviousId], cache.Index.Applied);
+    }
+
+    [Fact]
+    public void RunPerMonitor_NoMonitors_FallsBackToSingleApply()
+    {
+        ImageCache cache = SeededCache();
+        var state = new AppState();
+        var applier = new ProbingApplier(AppliedOnDisk, Ok);
+        List<(ImageId, string)> plan = [(Id(NewId), _imagePath), (Id(PreviousId), PreviousPath)];
+
+        ApplyResult result = ApplyStage.RunPerMonitor(applier, [], plan, cache, state, _statePath);
+
+        Assert.True(result.Ok);
+        Assert.Equal(1, applier.Calls);
+        Assert.Equal(0, applier.PerMonitorCalls);
+        Assert.Equal(_imagePath, applier.PathReceived);
+        Assert.Equal([NewId], applier.AppliedWhenCalled!);   // only the primary is on any desktop
+        Assert.Equal([NewId], AppliedOnDisk());
+        Assert.Equal(NewId, state.CurrentImageId);
+        Assert.Contains($"apply ok method=com id={NewId} path={_imagePath} monitors=0 ids={NewId} readback={_imagePath} position=DWPOS_FILL", LogText());
+    }
+
+    [Fact]
+    public void RunPerMonitor_LogsMonitorsAndIds()
+    {
+        ImageCache cache = SeededCache();
+        var applier = new ProbingApplier(AppliedOnDisk, Ok);
+        List<(ImageId, string)> plan = [(Id(NewId), _imagePath), (Id(PreviousId), PreviousPath)];
+
+        ApplyStage.RunPerMonitor(applier, [Left, Right], plan, cache, new AppState(), _statePath);
+
+        string log = LogText();
+        Assert.Contains($"apply ok method=com id={NewId} path={_imagePath} monitors=2 ids={NewId},{PreviousId} readback={_imagePath} position=DWPOS_FILL", log);
+        Assert.DoesNotContain("apply failed", log);
+    }
+
+    /// <summary>Three monitors, two images: the assignment index wraps by modulo, so the third monitor shows the primary again.</summary>
+    [Fact]
+    public void RunPerMonitor_MoreMonitorsThanPlanEntries_WrapsByModulo()
+    {
+        ImageCache cache = SeededCache();
+        var applier = new ProbingApplier(AppliedOnDisk, Ok);
+        var third = new MonitorHandle(@"\\?\DISPLAY#TEST#1&0&UID3#{guid}", 1920, 1080, 3840, 0);
+        List<(ImageId, string)> plan = [(Id(NewId), _imagePath), (Id(PreviousId), PreviousPath)];
+
+        ApplyStage.RunPerMonitor(applier, [Left, Right, third], plan, cache, new AppState(), _statePath);
+
+        Assert.Equal([_imagePath, PreviousPath, _imagePath], applier.AssignmentsReceived!.Select(a => a.AbsolutePath).ToArray());
+    }
+
+    [Fact]
+    public void RunPerMonitor_EmptyPlan_Throws()
+    {
+        ImageCache cache = SeededCache();
+        var applier = new ProbingApplier(AppliedOnDisk, Ok);
+
+        Assert.Throws<ArgumentException>(() => ApplyStage.RunPerMonitor(applier, [Left], [], cache, new AppState(), _statePath));
+        Assert.Equal(0, applier.Calls + applier.PerMonitorCalls);
     }
 }

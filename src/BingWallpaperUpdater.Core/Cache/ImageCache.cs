@@ -271,13 +271,21 @@ public sealed class ImageCache
         Index.Images.Any(i => string.Equals(i.File, file, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// Records the image about to be set on the desktop (single entry in Phase 1) and saves. Call it BEFORE the
+    /// Records the image about to be set on the desktop (the same-image path) and saves. Call it BEFORE the
     /// desktop changes so the eviction protection is on disk first (WR-07); <see cref="RestoreApplied"/> undoes it
     /// when the apply does not happen.
     /// </summary>
-    public void MarkApplied(ImageId id)
+    public void MarkApplied(ImageId id) => MarkApplied([id]);
+
+    /// <summary>
+    /// Records every image about to be set on some monitor (per-monitor mode, WALL-03) — distinct by ordinal ID,
+    /// in the order given (the primary first) — and saves. <see cref="EvictionPolicy"/> and <see cref="Add"/> read
+    /// every entry of <see cref="CacheIndex.Applied"/>, so all of them are protected from eviction (CACHE-02).
+    /// </summary>
+    public void MarkApplied(IEnumerable<ImageId> ids)
     {
-        Index.Applied = [id.Value];
+        ArgumentNullException.ThrowIfNull(ids);
+        Index.Applied = ids.Select(i => i.Value).Distinct(StringComparer.Ordinal).ToList();
         Save();
     }
 
