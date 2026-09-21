@@ -190,7 +190,15 @@ public sealed class RotationService : IDisposable
         }
 
         Log.Info($"schedule nudge source={source}");
-        _heartbeat?.Change(ScheduleMath.ResumeDebounce, ScheduleMath.HeartbeatPeriod);
+        try
+        {
+            _heartbeat?.Change(ScheduleMath.ResumeDebounce, ScheduleMath.HeartbeatPeriod);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Dispose raced a resume/network/clock signal already running on its own thread (the unsubscribe does
+            // not wait for in-flight handlers); there is nothing left to nudge (IN-01).
+        }
     }
 
     /// <summary>Any thread: the system clock changed — clamp a due time left more than one interval ahead (D-07), persist, nudge.</summary>
