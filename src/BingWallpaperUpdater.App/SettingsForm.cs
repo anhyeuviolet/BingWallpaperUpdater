@@ -8,6 +8,7 @@ using BingWallpaperUpdater.Core.Io;
 using BingWallpaperUpdater.Core.Model;
 using BingWallpaperUpdater.Core.Rotation;
 using BingWallpaperUpdater.Core.Scheduling;
+using BingWallpaperUpdater.Windows.Autostart;
 
 namespace BingWallpaperUpdater.App;
 
@@ -20,9 +21,13 @@ namespace BingWallpaperUpdater.App;
 /// <c>settings.json</c> atomically and calls <see cref="RotationService.ApplySettings"/> through <see cref="Commit"/>;
 /// there is no Save button. The current-image / times / last-error panel (UI-04) is a static rendering of
 /// <see cref="RotationService.Snapshot"/>, refreshed only when <see cref="RotationService.StateChanged"/> fires
-/// (marshalled with <see cref="Control.BeginInvoke(Action)"/>, Pitfall 6) — no timer, no countdown (locked). Created
-/// on demand by <see cref="TrayApplicationContext.ShowSettings"/> and disposed on close (UI-02). No dialog, balloon
-/// or toast is ever shown from here (D-15): a failure is a <see cref="Log.Warn(string, Exception?)"/> line.
+/// (marshalled with <see cref="Control.BeginInvoke(Action)"/>, Pitfall 6) — no timer, no countdown (locked). The
+/// "Start with Windows" row (INST-02) shows the OBSERVED registry state (<see cref="RegistryAutostartManager.IsEnabled"/>:
+/// Run value present and not disabled in Task Manager) rather than the persisted <see cref="Settings.Autostart"/>
+/// wish; ticking it writes both HKCU values at once, unticking deletes them, and the box is re-read from the
+/// registry afterwards so a failed write reverts visibly. Created on demand by
+/// <see cref="TrayApplicationContext.ShowSettings"/> and disposed on close (UI-02). No dialog, balloon or toast is
+/// ever shown from here (D-15): a failure is a <see cref="Log.Warn(string, Exception?)"/> line.
 /// </summary>
 [SupportedOSPlatform("windows8.0")]
 internal sealed class SettingsForm : Form
@@ -43,6 +48,7 @@ internal sealed class SettingsForm : Form
     private readonly ComboBox _resolution;
     private readonly ComboBox _market;
     private readonly ComboBox _monitors;
+    private readonly CheckBox _autostart;
     private readonly ComboBox _language;
     private readonly Label _title;
     private readonly Label _copyright;
@@ -114,6 +120,20 @@ internal sealed class SettingsForm : Form
         _monitors = Combo("MonitorsCombo", Settings.KnownMonitorModes.Select(m => new Item(m, MonitorText(m))).ToList(), settings.MonitorMode);
         _monitors.SelectedIndexChanged += (_, _) => OnValueChanged(_monitors, v => Commit(s => s.MonitorMode = v));
         AddRow(_table, "Label_Monitors", _monitors);
+
+        // Start with Windows (INST-02): the box shows what Task Manager shows (observed state), so an entry the user
+        // disabled there is unticked even while Settings.Autostart (the desired state) is still true.
+        _autostart = new CheckBox
+        {
+            Name = "AutostartCheck",
+            AutoSize = true,
+            Text = Strings.Get("Check_Autostart"),
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 6, 0, 6),
+            Checked = RegistryAutostartManager.IsEnabled(),
+        };
+        _autostart.CheckedChanged += (_, _) => OnAutostartChanged();
+        AddRow(_table, null, _autostart);
 
         // Language (L10N-03): save, re-apply the UI culture, re-text the tray menu now, then close-and-reopen this
         // window from a posted message so the new strings are visible without disposing the form inside the
@@ -270,6 +290,47 @@ internal sealed class SettingsForm : Form
         if (!_loading && combo.SelectedItem is Item it)
         {
             apply(it.Value);
+        }
+    }
+
+    /// <summary>
+    /// INST-02: the registry first (on -> Run value + an "enabled" StartupApproved value, which also re-enables a
+    /// Task Manager "Disabled"; off -> both values deleted), then the desired state through <see cref="Commit"/>
+    /// (<see cref="RotationService.ApplySettings"/> is harmless here), then the box is re-read from the registry so
+    /// a failed write — already logged by the adapter — reverts it instead of lying. No dialog (T-03-15).
+    /// </summary>
+    private void OnAutostartChanged()
+    {
+        if (_loading)
+        {
+            return;
+        }
+
+        bool on = _autostart.Checked;
+        string? exe = Environment.ProcessPath;
+        if (on && exe is { Length: > 0 })
+        {
+            RegistryAutostartManager.Enable(exe);
+        }
+        else if (!on)
+        {
+            RegistryAutostartManager.Disable();
+        }
+
+        Commit(s => s.Autostart = on);
+
+        bool observed = RegistryAutostartManager.IsEnabled();
+        if (observed != _autostart.Checked)
+        {
+            _loading = true;
+            try
+            {
+                _autostart.Checked = observed;
+            }
+            finally
+            {
+                _loading = false;
+            }
         }
     }
 
