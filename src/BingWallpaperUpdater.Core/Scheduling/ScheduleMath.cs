@@ -19,7 +19,7 @@ public static class ScheduleMath
     public static readonly TimeSpan MinLeadAfterIntervalChange = TimeSpan.FromSeconds(5);
 
     /// <summary>Backoff ladder after a failed fetch: about 5 min, then about 15 min, then the normal interval (D-13).</summary>
-    public static readonly TimeSpan[] RetryDelays = [TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(15)];
+    public static readonly IReadOnlyList<TimeSpan> RetryDelays = [TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(15)];
 
     /// <summary>True when the schedule is due: no due time persisted yet, or <paramref name="now"/> has reached it.</summary>
     public static bool IsDue(DateTimeOffset now, DateTimeOffset? nextDue) => nextDue is null || now >= nextDue.Value;
@@ -65,6 +65,6 @@ public static class ScheduleMath
     public static TimeSpan? RetryDelay(int failureStage)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(failureStage);
-        return failureStage < RetryDelays.Length ? RetryDelays[failureStage] : null;
+        return failureStage < RetryDelays.Count ? RetryDelays[failureStage] : null;
     }
 }
