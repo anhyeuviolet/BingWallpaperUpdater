@@ -20,6 +20,8 @@ public sealed partial class Settings
     public const string DefaultMode = "newest";
     public const string RandomMode = "random";
     public const string AutoLanguage = "auto";
+    public const string SameMonitorMode = "same";
+    public const string PerMonitorMode = "perMonitor";
 
     /// <summary>The resolutions the pipeline knows how to request and validate (see <c>BingImageUrl.MinDimensions</c>).</summary>
     public static readonly IReadOnlyList<string> KnownResolutions = ["UHD", "1920x1200", "1920x1080"];
@@ -29,6 +31,15 @@ public sealed partial class Settings
     /// <c>en</c> / <c>vi</c> force one. Resolved by <c>LanguageResolver</c>; never used to derive <see cref="Market"/>.
     /// </summary>
     public static readonly IReadOnlyList<string> KnownLanguages = ["auto", "en", "vi"];
+
+    /// <summary>Monitor modes (WALL-03): <c>same</c> puts one image on every monitor, <c>perMonitor</c> a different one on each.</summary>
+    public static readonly IReadOnlyList<string> KnownMonitorModes = [SameMonitorMode, PerMonitorMode];
+
+    /// <summary>
+    /// Bing markets offered in the UI (SRC-04); the <c>mkt</c> value is what the API receives, the image-ID market may
+    /// differ (<c>ROW</c>). A hand-edited <c>xx-YY</c> outside this list is still accepted by <see cref="Sanitize"/>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> KnownMarkets = ["en-US", "en-GB", "en-AU", "en-CA", "en-IN", "de-DE", "fr-FR", "ja-JP", "zh-CN", "vi-VN"];
 
     /// <summary>
     /// The rotation intervals the scheduler accepts, in minutes (ROT-01): 30 min, 1 h, 2 h, 4 h, 8 h, daily. Anything
@@ -60,6 +71,15 @@ public sealed partial class Settings
     /// </summary>
     public string Language { get; set; } = AutoLanguage;
 
+    /// <summary><c>same</c> (default) or <c>perMonitor</c>, canonical case (WALL-03). Only the mode is persisted, never monitor paths.</summary>
+    public string MonitorMode { get; set; } = SameMonitorMode;
+
+    /// <summary>
+    /// The desired autostart state (INST-02: on by default). The HKCU Run value is the observed state; the settings
+    /// window and the per-start rewrite reconcile the two (Plan 03-03). A Phase 1/2 file without the field loads as true.
+    /// </summary>
+    public bool Autostart { get; set; } = true;
+
     /// <summary>The interval as a <see cref="TimeSpan"/>; computed, never serialised.</summary>
     [JsonIgnore]
     public TimeSpan Interval => TimeSpan.FromMinutes(IntervalMinutes);
@@ -67,6 +87,10 @@ public sealed partial class Settings
     /// <summary>True when <see cref="Mode"/> is <see cref="RandomMode"/>; computed, never serialised.</summary>
     [JsonIgnore]
     public bool IsRandomMode => string.Equals(Mode, RandomMode, StringComparison.Ordinal);
+
+    /// <summary>True when <see cref="MonitorMode"/> is <see cref="PerMonitorMode"/>; computed, never serialised.</summary>
+    [JsonIgnore]
+    public bool IsPerMonitor => string.Equals(MonitorMode, PerMonitorMode, StringComparison.Ordinal);
 
     // Two ASCII letters, a hyphen, two ASCII letters — the only shape the Bing mkt parameter takes.
     [GeneratedRegex("^[A-Za-z]{2}-[A-Za-z]{2}$", RegexOptions.CultureInvariant)]
@@ -179,6 +203,22 @@ public sealed partial class Settings
         else if (!string.Equals(knownLanguage, Language, StringComparison.Ordinal))
         {
             Language = knownLanguage;
+            changed = true;
+        }
+
+        string? monitorMode = MonitorMode?.Trim();
+        string? knownMonitorMode = monitorMode is null
+            ? null
+            : KnownMonitorModes.FirstOrDefault(m => string.Equals(m, monitorMode, StringComparison.OrdinalIgnoreCase));
+        if (knownMonitorMode is null)
+        {
+            Log.Warn($"settings invalid field=MonitorMode value={Describe(MonitorMode)} using={SameMonitorMode}");
+            MonitorMode = SameMonitorMode;
+            changed = true;
+        }
+        else if (!string.Equals(knownMonitorMode, MonitorMode, StringComparison.Ordinal))
+        {
+            MonitorMode = knownMonitorMode;
             changed = true;
         }
 

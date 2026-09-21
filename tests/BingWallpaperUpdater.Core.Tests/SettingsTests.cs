@@ -215,4 +215,113 @@ public sealed class SettingsTests : IDisposable
         Assert.True(File.Exists(path));
         Assert.False(settings.Sanitize());
     }
+
+    // ---- Phase 3 fields: Language, MonitorMode, Autostart, KnownMarkets ------------------------------------
+
+    [Theory]
+    [InlineData("perMonitor", "perMonitor", false)]
+    [InlineData("same", "same", false)]
+    [InlineData("PERMONITOR", "perMonitor", true)]
+    [InlineData(" same ", "same", true)]
+    [InlineData("dual", "same", true)]
+    [InlineData("", "same", true)]
+    [InlineData(null, "same", true)]
+    public void Sanitize_MonitorMode_CanonicalisesOrFallsBack(string? input, string expected, bool expectChanged)
+    {
+        var settings = new Settings { MonitorMode = input! };
+
+        bool changed = settings.Sanitize();
+
+        Assert.Equal(expected, settings.MonitorMode);
+        Assert.Equal(expected == Settings.PerMonitorMode, settings.IsPerMonitor);
+        Assert.Equal(expectChanged, changed);
+        if (input == "dual")
+        {
+            Assert.Contains("settings invalid field=MonitorMode value='dual' using=same", LogText());
+        }
+    }
+
+    [Theory]
+    [InlineData("vi", "vi", false)]
+    [InlineData("en", "en", false)]
+    [InlineData("auto", "auto", false)]
+    [InlineData("VI", "vi", true)]
+    [InlineData(" Auto ", "auto", true)]
+    [InlineData("fr", "auto", true)]
+    [InlineData("", "auto", true)]
+    [InlineData(null, "auto", true)]
+    public void Sanitize_Language_CanonicalisesOrFallsBack(string? input, string expected, bool expectChanged)
+    {
+        var settings = new Settings { Language = input! };
+
+        bool changed = settings.Sanitize();
+
+        Assert.Equal(expected, settings.Language);
+        Assert.Equal(expectChanged, changed);
+        if (input == "fr")
+        {
+            Assert.Contains("settings invalid field=Language value='fr' using=auto", LogText());
+        }
+    }
+
+    [Fact]
+    public void Defaults_NewFields_AreAutoSameTrue()
+    {
+        var settings = new Settings();
+
+        Assert.Equal("auto", settings.Language);
+        Assert.Equal("same", settings.MonitorMode);
+        Assert.True(settings.Autostart);
+        Assert.False(settings.IsPerMonitor);
+    }
+
+    [Fact]
+    public void KnownMarkets_StartsWithEnUs_ContainsViVn_InFixedOrder()
+    {
+        Assert.Equal(
+            ["en-US", "en-GB", "en-AU", "en-CA", "en-IN", "de-DE", "fr-FR", "ja-JP", "zh-CN", "vi-VN"],
+            Settings.KnownMarkets);
+        Assert.Equal(["same", "perMonitor"], Settings.KnownMonitorModes);
+        Assert.Equal(["auto", "en", "vi"], Settings.KnownLanguages);
+    }
+
+    [Fact]
+    public void LoadOrCreate_Phase2File_WithoutNewFields_LoadsDefaults_AndSanitizeReturnsFalse()
+    {
+        string path = Path.Combine(_dir, "settings.json");
+        const string body = """{ "schemaVersion": 1, "market": "en-US", "resolution": "UHD", "intervalMinutes": 60, "mode": "random" }""";
+        File.WriteAllText(path, body);
+
+        Settings settings = Settings.LoadOrCreate(path);
+
+        Assert.Equal("auto", settings.Language);
+        Assert.Equal("same", settings.MonitorMode);
+        Assert.True(settings.Autostart);
+        Assert.False(settings.IsPerMonitor);
+        Assert.Equal(60, settings.IntervalMinutes);
+        Assert.Equal("random", settings.Mode);
+        Assert.False(settings.Sanitize());   // missing new fields never force a rewrite (UI-03 empty edge)
+        Assert.Equal(body, File.ReadAllText(path));
+        Assert.DoesNotContain("settings invalid", LogText());
+    }
+
+    [Fact]
+    public void Save_RoundTrips_NewFields()
+    {
+        string path = Path.Combine(_dir, "settings.json");
+        var settings = new Settings { MonitorMode = "perMonitor", Language = "vi", Autostart = false };
+
+        settings.Save(path);
+        Settings loaded = Settings.LoadOrCreate(path);
+
+        Assert.Equal("perMonitor", loaded.MonitorMode);
+        Assert.True(loaded.IsPerMonitor);
+        Assert.Equal("vi", loaded.Language);
+        Assert.False(loaded.Autostart);
+        string text = File.ReadAllText(path);
+        Assert.Contains("\"monitorMode\": \"perMonitor\"", text);
+        Assert.Contains("\"language\": \"vi\"", text);
+        Assert.Contains("\"autostart\": false", text);
+        Assert.DoesNotContain("isPerMonitor", text);
+    }
 }

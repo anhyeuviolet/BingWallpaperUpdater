@@ -256,7 +256,7 @@ public sealed class RotationService : IDisposable
         }
 
         TrySaveState();
-        Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} next={ReadNextDue()?.ToString("O") ?? "-"}");
+        Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} resolution={_settings.Resolution} market={_settings.Market} monitors={_settings.MonitorMode} language={_settings.Language} next={ReadNextDue()?.ToString("O") ?? "-"}");
         Nudge("settings");
     }
 

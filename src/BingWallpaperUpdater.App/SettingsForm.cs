@@ -28,6 +28,10 @@ internal sealed class SettingsForm : Form
     private readonly TableLayoutPanel _table;
     private readonly List<ComboBox> _combos = [];
     private readonly ComboBox _interval;
+    private readonly ComboBox _mode;
+    private readonly ComboBox _resolution;
+    private readonly ComboBox _market;
+    private readonly ComboBox _monitors;
     private bool _loading;
 
     public SettingsForm(Settings settings, RotationService rotation, TrayApplicationContext context, CancellationToken shutdown)
@@ -69,16 +73,74 @@ internal sealed class SettingsForm : Form
             "IntervalCombo",
             Settings.AllowedIntervals.Select(m => new Item(m.ToString(CultureInfo.InvariantCulture), Strings.Get("Interval_" + m.ToString(CultureInfo.InvariantCulture)))).ToList(),
             settings.IntervalMinutes.ToString(CultureInfo.InvariantCulture));
-        _interval.SelectedIndexChanged += (_, _) =>
-        {
-            if (!_loading && _interval.SelectedItem is Item it)
-            {
-                Commit(s => s.IntervalMinutes = int.Parse(it.Value, CultureInfo.InvariantCulture));
-            }
-        };
+        _interval.SelectedIndexChanged += (_, _) => OnValueChanged(_interval, v => Commit(s => s.IntervalMinutes = int.Parse(v, CultureInfo.InvariantCulture)));
         AddRow("Label_Interval", _interval);
 
+        // Mode (ROT-02/03): read live by every tick (Settings.IsRandomMode); Commit alone is enough.
+        _mode = Combo("ModeCombo", Settings.KnownModes.Select(m => new Item(m, ModeText(m))).ToList(), settings.Mode);
+        _mode.SelectedIndexChanged += (_, _) => OnValueChanged(_mode, v => Commit(s => s.Mode = v));
+        AddRow("Label_Mode", _mode);
+
+        // Resolution (SRC-05): built from KnownResolutions so the Auto value Plan 03-02 adds appears by itself
+        // (Resolution_Auto is already in the resx).
+        _resolution = Combo("ResolutionCombo", Settings.KnownResolutions.Select(r => new Item(r, Strings.Get("Resolution_" + r))).ToList(), settings.Resolution);
+        _resolution.SelectedIndexChanged += (_, _) => OnValueChanged(_resolution, v => Commit(s => s.Resolution = v));
+        AddRow("Label_Resolution", _resolution);
+
+        // Market (SRC-04): the mkt the API receives; a hand-edited market outside KnownMarkets is shown, never
+        // silently rewritten. Names come from ICU under the current UI culture, so no resx entries are needed.
+        List<string> markets = [.. Settings.KnownMarkets];
+        if (!markets.Contains(settings.Market, StringComparer.Ordinal))
+        {
+            markets.Add(settings.Market);
+        }
+
+        _market = Combo("MarketCombo", markets.Select(m => new Item(m, MarketText(m))).ToList(), settings.Market);
+        _market.SelectedIndexChanged += (_, _) => OnValueChanged(_market, v => Commit(s => s.Market = v));
+        AddRow("Label_Market", _market);
+
+        // Monitors (WALL-03): read live at the apply step (Plan 03-04); only the mode is persisted.
+        _monitors = Combo("MonitorsCombo", Settings.KnownMonitorModes.Select(m => new Item(m, MonitorText(m))).ToList(), settings.MonitorMode);
+        _monitors.SelectedIndexChanged += (_, _) => OnValueChanged(_monitors, v => Commit(s => s.MonitorMode = v));
+        AddRow("Label_Monitors", _monitors);
+
         _loading = false;
+    }
+
+    /// <summary>Runs <paramref name="apply"/> with the selected item's value, except while the constructor populates the controls.</summary>
+    private void OnValueChanged(ComboBox combo, Action<string> apply)
+    {
+        if (!_loading && combo.SelectedItem is Item it)
+        {
+            apply(it.Value);
+        }
+    }
+
+    private static string ModeText(string mode) => mode switch
+    {
+        Settings.DefaultMode => Strings.Get("Mode_Newest"),
+        Settings.RandomMode => Strings.Get("Mode_Random"),
+        _ => mode,
+    };
+
+    private static string MonitorText(string monitorMode) => monitorMode switch
+    {
+        Settings.SameMonitorMode => Strings.Get("Monitors_Same"),
+        Settings.PerMonitorMode => Strings.Get("Monitors_PerMonitor"),
+        _ => monitorMode,
+    };
+
+    /// <summary>"English (United States) (en-US)" — the display name is localized by ICU under the current UI culture; an unknown code shows bare.</summary>
+    private static string MarketText(string market)
+    {
+        try
+        {
+            return $"{CultureInfo.GetCultureInfo(market).DisplayName} ({market})";
+        }
+        catch (CultureNotFoundException)
+        {
+            return market;
+        }
     }
 
     /// <summary>A ComboBox entry: the persisted value and its localized text.</summary>

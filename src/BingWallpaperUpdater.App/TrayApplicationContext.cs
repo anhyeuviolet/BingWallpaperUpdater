@@ -164,7 +164,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _icon.Visible = true;
 
         TimeSpan initialDelay = startup ? TimeSpan.FromSeconds(Random.Shared.Next(30, 61)) : TimeSpan.Zero;
-        Log.Info($"schedule start launch={(startup ? "autostart" : "manual")} firstTickIn={(int)initialDelay.TotalSeconds}s interval={_settings.IntervalMinutes} mode={_settings.Mode} resolution={_settings.Resolution} market={_settings.Market} language={_settings.Language}");
+        Log.Info($"schedule start launch={(startup ? "autostart" : "manual")} firstTickIn={(int)initialDelay.TotalSeconds}s interval={_settings.IntervalMinutes} mode={_settings.Mode} resolution={_settings.Resolution} market={_settings.Market} monitors={_settings.MonitorMode} language={_settings.Language}");
         _rotation.Start(initialDelay, _cts.Token);
     }
 

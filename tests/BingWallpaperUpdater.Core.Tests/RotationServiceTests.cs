@@ -1045,7 +1045,7 @@ public sealed class RotationServiceTests : IDisposable
 
         Assert.Equal(T0 + TimeSpan.FromMinutes(60), h.Service.NextDueUtc);   // LastAppliedUtc + new interval, not now + interval
         Assert.Equal(T0 + TimeSpan.FromMinutes(60), SavedState()!.NextDueUtc);
-        Assert.Contains($"settings applied interval=60 mode=newest next={(T0 + TimeSpan.FromMinutes(60)):O}", LogText());
+        Assert.Contains($"settings applied interval=60 mode=newest resolution=UHD market=en-US monitors=same language=auto next={(T0 + TimeSpan.FromMinutes(60)):O}", LogText());
         Assert.Contains("schedule nudge source=settings", LogText());
 
         await AdvanceAsync(h, TimeSpan.FromMinutes(50));     // reaches T0 + 60 min: the recomputed schedule fires once
@@ -1089,7 +1089,7 @@ public sealed class RotationServiceTests : IDisposable
         h.Service.ApplySettings();
 
         Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
-        Assert.Contains($"settings applied interval=30 mode=newest next={(T0 + Interval):O}", LogText());
+        Assert.Contains($"settings applied interval=30 mode=newest resolution=UHD market=en-US monitors=same language=auto next={(T0 + Interval):O}", LogText());
         Assert.Contains("schedule nudge source=settings", LogText());
     }
 
@@ -1144,7 +1144,7 @@ public sealed class RotationServiceTests : IDisposable
 
         Assert.Equal(T0 + Interval, h.Service.NextDueUtc);   // the schedule keeps the last accepted interval
         Assert.Contains("settings rejected field=IntervalMinutes value=0 keeping=30", LogText());
-        Assert.Contains($"settings applied interval=30 mode=newest next={(T0 + Interval):O}", LogText());
+        Assert.Contains($"settings applied interval=30 mode=newest resolution=UHD market=en-US monitors=same language=auto next={(T0 + Interval):O}", LogText());
 
         await AdvanceAsync(h, Interval);                     // 30 beats and the interval-due tick, all on the applied interval
 
