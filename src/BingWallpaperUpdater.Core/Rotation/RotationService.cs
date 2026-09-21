@@ -91,8 +91,8 @@ public sealed class RotationService : IDisposable
     /// <summary>True while a tick holds the gate; the tray reads it to disable "Next wallpaper" (D-05).</summary>
     public bool IsTickRunning => _gate.CurrentCount == 0;
 
-    /// <summary>Mirrors <see cref="AppState.NextDueUtc"/>.</summary>
-    public DateTimeOffset? NextDueUtc => _state.NextDueUtc;
+    /// <summary>Mirrors <see cref="AppState.NextDueUtc"/> (read under the lock its writers hold, WR-03).</summary>
+    public DateTimeOffset? NextDueUtc => ReadNextDue();
 
     /// <summary>
     /// The interval every schedule computation uses: the last value <see cref="ApplySettings"/> accepted (or the
@@ -248,7 +248,7 @@ public sealed class RotationService : IDisposable
         }
 
         TrySaveState();
-        Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} next={_state.NextDueUtc?.ToString("O") ?? "-"}");
+        Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} next={ReadNextDue()?.ToString("O") ?? "-"}");
         Nudge("settings");
     }
 
@@ -323,9 +323,11 @@ public sealed class RotationService : IDisposable
 
         DateTimeOffset now = _time.GetUtcNow();
         DateTimeOffset? retryDue;
+        DateTimeOffset? nextDue;
         lock (_sync)
         {
             _state.NextDueUtc = ScheduleMath.ClampAfterClockChange(now, _state.NextDueUtc, Interval);   // D-07, idempotent
+            nextDue = _state.NextDueUtc;
             retryDue = _retryDueUtc;
         }
 
@@ -345,7 +347,7 @@ public sealed class RotationService : IDisposable
             return;
         }
 
-        if (ScheduleMath.IsDue(now, _state.NextDueUtc))
+        if (ScheduleMath.IsDue(now, nextDue))
         {
             _ = RunTickAsync(TickReason.Interval, _ct);
         }
@@ -358,7 +360,7 @@ public sealed class RotationService : IDisposable
         DateTimeOffset now = _time.GetUtcNow();
         Log.Info($"tick reason={reason} mode={_settings.Mode} interval={_appliedIntervalMinutes}");
 
-        bool intervalDue = ScheduleMath.IsDue(now, _state.NextDueUtc);   // captured BEFORE any re-arm
+        bool intervalDue = ScheduleMath.IsDue(now, ReadNextDue());   // captured BEFORE any re-arm
 
         // Everything step 5/6 reads is declared here so the tail runs whatever steps 1-4 did — including throwing
         // (G-01 / CR-01): before this try/catch an exception skipped the re-arm, the ladder and the save, and the
@@ -374,7 +376,11 @@ public sealed class RotationService : IDisposable
         {
             // 1. fetch — one conditional GET per tick (D-02); null means neither source produced a row (Pitfall 5).
             CatalogEntry? entry = await _catalog.GetNewestAsync(_settings.Market, ct).ConfigureAwait(false);
-            _state.LastCheckUtc = now;
+            lock (_sync)
+            {
+                _state.LastCheckUtc = now;   // a 24-byte DateTimeOffset?: never torn by a concurrent save (WR-03)
+            }
+
             fetchFailed = entry is null;
 
             // 2. decide
@@ -449,6 +455,7 @@ public sealed class RotationService : IDisposable
 
         // 5. re-arm — runs on every non-cancelled path, including a tick that threw.
         DateTimeOffset? retryDue;
+        DateTimeOffset? nextDue;
         lock (_sync)
         {
             // Next re-arms only when it applied (D-05); Startup/Interval re-arm when the schedule was due (RESEARCH A3,
@@ -489,6 +496,7 @@ public sealed class RotationService : IDisposable
             }
 
             retryDue = _retryDueUtc;
+            nextDue = _state.NextDueUtc;
         }
 
         if (threw)
@@ -500,15 +508,32 @@ public sealed class RotationService : IDisposable
         // retry time is not part of AppState, so state.json never carries it. decision is null only when the throw
         // preceded step 2, hence the "-" tokens.
         TrySaveState();
-        Log.Info($"tick done reason={reason} result={result} decision={decision?.Kind.ToString() ?? "-"} why={decision?.Why ?? "-"} next={_state.NextDueUtc?.ToString("O") ?? "-"} retry={retryDue?.ToString("O") ?? "-"}");
+        Log.Info($"tick done reason={reason} result={result} decision={decision?.Kind.ToString() ?? "-"} why={decision?.Why ?? "-"} next={nextDue?.ToString("O") ?? "-"} retry={retryDue?.ToString("O") ?? "-"}");
         return result;
     }
 
+    private DateTimeOffset? ReadNextDue()
+    {
+        lock (_sync)
+        {
+            return _state.NextDueUtc;
+        }
+    }
+
+    /// <summary>
+    /// Serialises <see cref="AppState"/> under <c>_sync</c> (WR-03): the schedule fields are written under that lock
+    /// from the timer thread, the tick, <see cref="OnClockChanged"/> and <see cref="ApplySettings"/>, so an unlocked
+    /// save could read a torn <c>DateTimeOffset?</c> and two concurrent saves would collide on <c>state.json.tmp</c>
+    /// (<c>FileShare.None</c>), silently dropping the loser's schedule.
+    /// </summary>
     private void TrySaveState()
     {
         try
         {
-            _state.Save(_statePath);
+            lock (_sync)
+            {
+                _state.Save(_statePath);
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
