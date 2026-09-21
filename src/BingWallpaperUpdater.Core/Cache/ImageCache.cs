@@ -49,8 +49,16 @@ public sealed class ImageCache
         Index = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex) ?? new CacheIndex();
         Index.Applied ??= [];
         Index.Images ??= [];
+        ClampNextSeq();
+    }
 
-        // NextSeq must stay above every Seq already handed out, whatever a hand-edited or older index says.
+    /// <summary>
+    /// <see cref="CacheIndex.NextSeq"/> must stay above every <see cref="CachedImage.Seq"/> already handed out,
+    /// whatever a hand-edited or older index says (and whatever a rebuilt index carries). Applied after every
+    /// assignment to <see cref="Index"/> so <see cref="Add"/> can never re-issue a Seq (WR-01).
+    /// </summary>
+    private void ClampNextSeq()
+    {
         long maxSeq = Index.Images.Count == 0 ? 0 : Index.Images.Max(i => i.Seq);
         Index.NextSeq = Math.Max(Math.Max(Index.NextSeq, 1), maxSeq + 1);
     }
@@ -58,7 +66,9 @@ public sealed class ImageCache
     /// <summary>
     /// Startup reconcile (CACHE-05): load the index, drop entries whose file is missing, delete stray
     /// <c>*.part</c> files, leave every other file alone, and save only when something changed.
-    /// Runs before any network call; a hand-edited folder or corrupt index never throws.
+    /// <see cref="CacheIndex.NextSeq"/> survives the pass (carried by the reconciler and re-clamped here), so
+    /// the next <see cref="Add"/> after a restart never reuses a Seq. Runs before any network call; a
+    /// hand-edited folder or corrupt index never throws.
     /// </summary>
     public void Reconcile()
     {
@@ -81,6 +91,7 @@ public sealed class ImageCache
         }
 
         Index = result.Index;
+        ClampNextSeq();
         Log.Info($"reconcile dropped={result.DroppedIds.Count} parts={parts}");
 
         if (result.DroppedIds.Count > 0 || parts > 0 || Index.Applied.Count != appliedBefore)

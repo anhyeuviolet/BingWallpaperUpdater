@@ -18,6 +18,8 @@ public static class CacheReconciler
     /// are bare file names (no paths) compared ordinal-ignore-case. An entry whose <see cref="CachedImage.File"/> is
     /// not a bare name (contains a separator or <c>..</c>) is dropped like a missing file so it can never point
     /// outside the cache directory (T-01-15). Applied IDs without a surviving entry are dropped too.
+    /// <see cref="CacheIndex.NextSeq"/> is carried over unchanged and never lowered when entries are dropped: it is
+    /// a monotonic counter, and re-issuing a <see cref="CachedImage.Seq"/> would break cache ordering (WR-01).
     /// </summary>
     public static ReconcileResult Reconcile(CacheIndex? loaded, IEnumerable<string> existingFileNames)
     {
@@ -42,7 +44,11 @@ public static class CacheReconciler
             }
         }
 
-        var index = new CacheIndex { SchemaVersion = loaded?.SchemaVersion ?? 1 };
+        var index = new CacheIndex
+        {
+            SchemaVersion = loaded?.SchemaVersion ?? 1,
+            NextSeq = loaded?.NextSeq ?? 1,
+        };
         var dropped = new List<string>();
         foreach (CachedImage image in loaded?.Images ?? [])
         {
