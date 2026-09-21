@@ -190,6 +190,42 @@ public sealed class ImageCacheEvictionTests : IDisposable
     }
 
     /// <summary>
+    /// IN-09: the index is saved before any victim file is deleted. When the save fails, the in-memory index is put
+    /// back to what index.json still says, every file stays, and the caller sees the exception.
+    /// </summary>
+    [Fact]
+    public void Add_SaveThrows_RestoresMemoryToDisk_DeletesNothing_AndRethrows()
+    {
+        List<CachedImage> ten = Ascending(10);
+        foreach (CachedImage image in ten)
+        {
+            File.WriteAllBytes(Path.Combine(_dir, image.File), new byte[16]);
+        }
+
+        string indexPath = Path.Combine(_dir, "index.json");
+        AtomicJsonFile.Save(indexPath, new CacheIndex { Applied = ["OHR.Image1_EN-US1"], Images = ten }, CoreJsonContext.Default.CacheIndex);
+        var cache = new ImageCache(_dir, indexPath);
+        cache.Load();
+        long nextSeqBefore = cache.Index.NextSeq;
+        CachedImage eleventh = Image(11, 11);
+        File.WriteAllBytes(Path.Combine(_dir, eleventh.File), new byte[16]);
+        Directory.CreateDirectory(indexPath + ".tmp");   // AtomicJsonFile.Save opens <path>.tmp with FileMode.Create -> throws
+
+        Assert.ThrowsAny<Exception>(() => cache.Add(eleventh));
+
+        Assert.Equal(10, cache.Index.Images.Count);
+        Assert.DoesNotContain(cache.Index.Images, i => i.Id == eleventh.Id);
+        Assert.Contains(cache.Index.Images, i => i.Id == "OHR.Image2_EN-US2");   // the would-be victim is still listed
+        Assert.True(File.Exists(Path.Combine(_dir, "2026-09-01_Image2.jpg")), "no file may be deleted when the index was not saved");
+        Assert.Equal(nextSeqBefore, cache.Index.NextSeq);
+        Assert.Equal(0, eleventh.Seq);
+        Assert.DoesNotContain("evict id=", LogText());
+
+        CacheIndex onDisk = AtomicJsonFile.Load(indexPath, CoreJsonContext.Default.CacheIndex)!;
+        Assert.Equal(cache.Index.Images.Select(i => i.Id), onDisk.Images.Select(i => i.Id));   // memory == disk
+    }
+
+    /// <summary>
     /// WR-01: an index from an earlier build can hold two IDs that share one file (the old naming dropped market and
     /// suffix). Evicting one of them must not delete the bytes the other — here the applied image — still points at.
     /// </summary>

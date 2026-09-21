@@ -154,7 +154,23 @@ public sealed class ImageCache
             DownloadedUtc = _time.GetUtcNow(),
         };
 
-        Add(cached);
+        try
+        {
+            Add(cached);
+        }
+        catch
+        {
+            // The index could not record the download (IN-09): the bytes are unowned, so remove them rather than
+            // leave an orphan the reconcile pass will never touch — unless an entry still on the index names that
+            // very file (a replaced entry with the same date prefix), in which case it still owns them.
+            if (!IsFileNamedByIndex(fileName))
+            {
+                TryDeleteOwnedFile(fileName);
+            }
+
+            throw;
+        }
+
         Log.Info($"cache add id={cached.Id} file={cached.File} bytes={cached.Bytes} dims={cached.Width}x{cached.Height}");
         return cached;
     }
@@ -162,26 +178,45 @@ public sealed class ImageCache
     /// <summary>
     /// Appends <paramref name="image"/> (replacing any entry with the same id + resolution), stamps it with the next
     /// <see cref="CachedImage.Seq"/> so cache order never depends on the wall clock (WR-01), evicts down to
-    /// <see cref="MaxImages"/> with <c>Applied ∪ {image.Id}</c> protected, deletes each victim's file best-effort
-    /// — unless a surviving entry still names that file, in which case the bytes stay — logs <c>evict id= file=</c>
-    /// per victim, and saves the index exactly once at the end.
+    /// <see cref="MaxImages"/> with <c>Applied ∪ {image.Id}</c> protected, saves the index exactly once, and only
+    /// then deletes each victim's file best-effort — unless a surviving entry still names that file, in which case
+    /// the bytes stay — logging <c>evict id= file=</c> per victim. The save comes before any delete (IN-09): when
+    /// <c>index.json</c> cannot be written the in-memory index is put back to what the file still says and no
+    /// bytes are touched, so memory and disk never diverge and the caller sees the exception.
     /// </summary>
     public CachedImage Add(CachedImage image)
     {
         ArgumentNullException.ThrowIfNull(image);
 
-        List<CachedImage> replaced = Index.Images.FindAll(i =>
+        List<CachedImage> before = Index.Images;
+        long nextSeqBefore = Index.NextSeq;
+        List<CachedImage> images = [.. before];
+
+        List<CachedImage> replaced = images.FindAll(i =>
             string.Equals(i.Id, image.Id, StringComparison.Ordinal)
             && string.Equals(i.Resolution, image.Resolution, StringComparison.Ordinal));
-        Index.Images.RemoveAll(replaced.Contains);
+        images.RemoveAll(replaced.Contains);
         image.Seq = Index.NextSeq++;
-        Index.Images.Add(image);
+        images.Add(image);
 
         var protectedIds = new HashSet<string>(Index.Applied, StringComparer.Ordinal) { image.Id };
-        IReadOnlyList<CachedImage> victims = EvictionPolicy.SelectVictims(Index.Images, protectedIds, MaxImages);
+        IReadOnlyList<CachedImage> victims = EvictionPolicy.SelectVictims(images, protectedIds, MaxImages);
         foreach (CachedImage victim in victims)
         {
-            Index.Images.Remove(victim);
+            images.Remove(victim);
+        }
+
+        Index.Images = images;
+        try
+        {
+            Save();
+        }
+        catch
+        {
+            Index.Images = before;
+            Index.NextSeq = nextSeqBefore;
+            image.Seq = 0;
+            throw;
         }
 
         // A stale file left by a replaced entry (different date prefix, same id + resolution) is owned by the index
@@ -210,7 +245,6 @@ public sealed class ImageCache
             DeleteVictimFile(victim);
         }
 
-        Save();
         return image;
     }
 

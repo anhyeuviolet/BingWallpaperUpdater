@@ -1397,6 +1397,10 @@ public sealed class RotationServiceTests : IDisposable
         CacheIndex onDisk = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!;
         Assert.Equal(new[] { MiddleId }, onDisk.Applied);
         Assert.DoesNotContain(onDisk.Images, i => string.Equals(i.Id, FreshId, StringComparison.Ordinal));   // the failed Add never reached disk
+        // IN-09: memory matches disk after the failed save, and the unrecorded download is not left as an orphan.
+        Assert.DoesNotContain(h.Cache.Index.Images, i => string.Equals(i.Id, FreshId, StringComparison.Ordinal));
+        Assert.Empty(Directory.GetFiles(_dir, "*ParisSunset*"));
+        Assert.Equal(1, ImageDownloads(h));
         Assert.Equal(now1 + Interval, h.Service.NextDueUtc);
         Assert.Equal(now1 + Interval, SavedState()!.NextDueUtc);   // state.json has its own .tmp, so the tail's save works
         Assert.Equal(1, h.Service.FailureStage);
@@ -1410,6 +1414,8 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(1, LogCount("tick reason=Retry"));
         Assert.Equal(1, LogCount("tick failed reason=Retry"));
         Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(2, ImageDownloads(h));               // not a cache hit: the unrecorded image is downloaded again (IN-09)
+        Assert.DoesNotContain(h.Cache.Index.Images, i => string.Equals(i.Id, FreshId, StringComparison.Ordinal));
         Assert.Equal(2, h.Service.FailureStage);
         Assert.Equal(_time.GetUtcNow() + TimeSpan.FromMinutes(15), h.Service.RetryDueUtc);
         Assert.Equal(now1 + Interval, h.Service.NextDueUtc);   // a Retry never re-arms
@@ -1429,9 +1435,15 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(0, h.Service.FailureStage);
         Assert.Null(h.Service.RetryDueUtc);
         Assert.Equal(now1 + Interval, h.Service.NextDueUtc);
+        Assert.Equal(3, ImageDownloads(h));
+        Assert.Equal(1, LogCount("cache add id=" + FreshId));
         onDisk = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!;
         Assert.Equal(new[] { FreshId }, onDisk.Applied);
+        Assert.Contains(onDisk.Images, i => string.Equals(i.Id, FreshId, StringComparison.Ordinal));
     }
+
+    private static int ImageDownloads(Harness h) =>
+        h.Http.Requests.Count(r => r.Uri.AbsolutePath.StartsWith(ImagePath, StringComparison.Ordinal));
 
     [Fact]
     public async Task Tick_ApplyThrowsNonTokenCancellation_IsFailedNotCancelled()
