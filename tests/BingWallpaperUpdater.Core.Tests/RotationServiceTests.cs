@@ -1098,4 +1098,163 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Null(h.Service.RetryDueUtc);
         Assert.Equal(T0 + Interval + Interval, h.Service.NextDueUtc);      // a Retry never re-arms
     }
+
+    [Fact]
+    public async Task Interval_ApplyFails_RearmsAndDoesNotRetryEveryMinute()
+    {
+        // The return-value failure (IN-07): the fetch succeeded, so an apply failure is retried on the interval and
+        // never on the ladder — D-13 is about fetches (the 02-01 rule).
+        Harness h = await StartNotDueWithMiddleApplied_ThenCatalogMoved();
+        h.Applier.FailNext = true;
+
+        await AdvanceAsync(h, Interval);
+
+        DateTimeOffset now = _time.GetUtcNow();
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Contains("apply failed method=fake error=forced failure", LogText());
+        Assert.Contains("tick done reason=Interval result=ApplyFailed decision=ApplyNew why=new", LogText());
+        Assert.Equal(0, LogCount("tick failed"));
+        Assert.Equal(MiddleId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(MiddleId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(new[] { MiddleId }, h.Cache.Index.Applied);
+        Assert.Equal(now + Interval, h.Service.NextDueUtc);
+        Assert.Equal(now + Interval, SavedState()!.NextDueUtc);
+        Assert.Equal(0, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));   // where a ladder retry would have fired: nothing
+
+        Assert.Equal(2, LogCount("tick reason="));
+        Assert.Equal(1, h.Applier.Calls);
+
+        await AdvanceAsync(h, Interval - TimeSpan.FromMinutes(5));   // the next interval-due tick applies the image
+
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Contains("tick done reason=Interval result=Applied decision=ApplyNew why=new", LogText());
+    }
+
+    [Fact]
+    public async Task Startup_ApplyThrows_NotReplayedEveryBeat()
+    {
+        // Fresh state, empty cache: the Startup tick is due, downloads the newest image and its applier throws. The
+        // dispatch-time flag means the heartbeat never replays Startup; the ladder (not the heartbeat) recovers it.
+        Harness h = Build(Newest(), new AppState());
+        h.Applier.ThrowNext = new InvalidOperationException("simulated COM failure");
+
+        await StartAsync(h);
+
+        Assert.Equal(1, LogCount("tick reason=Startup"));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Contains("tick failed reason=Startup error=simulated COM failure", LogText());
+        Assert.Contains("tick done reason=Startup result=Failed decision=ApplyNew why=new", LogText());
+        Assert.Null(h.State.CurrentImageId);
+        Assert.Null(h.State.LastSeenNewestId);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Equal(T0 + Interval, SavedState()!.NextDueUtc);
+        Assert.Equal(1, h.Service.FailureStage);
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(4));   // four beats: no Startup replay, no Interval, no Retry
+
+        Assert.Equal(1, LogCount("tick reason=Startup"));
+        Assert.Equal(1, LogCount("tick reason="));
+        Assert.Equal(1, h.Applier.Calls);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(1));   // the ladder-due beat recovers
+
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(0, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+    }
+
+    [Fact]
+    public async Task Interval_EnsureSaveThrows_FollowsLadder_ThenRecovers()
+    {
+        // The most realistic trigger: index.json cannot be written. AtomicJsonFile.Save opens <path>.tmp with
+        // FileMode.Create, so a directory in that place makes the FileStream constructor throw
+        // (UnauthorizedAccessException — the same family as a locked or read-only index.json). The throw site is
+        // ImageCache.Add -> Save() at the end of EnsureAsync, after the download succeeded and before the applier.
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")], applied: MiddleId);   // NewestId is NOT cached
+        Harness h = await StartNotDueWithMiddleApplied_ThenCatalogMoved(cache);
+        string tmpBlocker = _indexPath + ".tmp";
+        Directory.CreateDirectory(tmpBlocker);
+
+        await AdvanceAsync(h, Interval);   // T0 + 30: the interval-due tick downloads, then Add's Save throws
+
+        DateTimeOffset now1 = _time.GetUtcNow();
+        Assert.Equal(1, LogCount("tick reason=Interval"));
+        Assert.Equal(0, h.Applier.Calls);                  // the applier was never reached
+        Assert.Equal(0, LogCount("cache add"));            // Add threw before its log line
+        Assert.Contains("tick failed reason=Interval error=", LogText());
+        Assert.Contains("tick done reason=Interval result=Failed decision=ApplyNew why=new", LogText());
+        Assert.Equal(MiddleId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(MiddleId, h.State.CurrentImageId, StringComparer.Ordinal);
+        CacheIndex onDisk = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!;
+        Assert.Equal(new[] { MiddleId }, onDisk.Applied);
+        Assert.DoesNotContain(onDisk.Images, i => string.Equals(i.Id, NewestId, StringComparison.Ordinal));   // the failed Add never reached disk
+        Assert.Equal(now1 + Interval, h.Service.NextDueUtc);
+        Assert.Equal(now1 + Interval, SavedState()!.NextDueUtc);   // state.json has its own .tmp, so the tail's save works
+        Assert.Equal(1, h.Service.FailureStage);
+        Assert.Equal(now1 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(4));
+        Assert.Equal(2, LogCount("tick reason="));
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(1));   // first retry, the disk is still unwritable
+
+        Assert.Equal(1, LogCount("tick reason=Retry"));
+        Assert.Equal(1, LogCount("tick failed reason=Retry"));
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(2, h.Service.FailureStage);
+        Assert.Equal(_time.GetUtcNow() + TimeSpan.FromMinutes(15), h.Service.RetryDueUtc);
+        Assert.Equal(now1 + Interval, h.Service.NextDueUtc);   // a Retry never re-arms
+        AssertStateFileHasNoRetry();
+
+        await AdvanceAsync(h, TimeSpan.FromMinutes(14));
+        Assert.Equal(3, LogCount("tick reason="));
+
+        Directory.Delete(tmpBlocker);
+        await AdvanceAsync(h, TimeSpan.FromMinutes(1));   // second retry, the disk is writable again
+
+        Assert.Equal(2, LogCount("tick reason=Retry"));
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Contains("tick done reason=Retry result=Applied decision=ApplyNew why=new", LogText());
+        Assert.Equal(0, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+        Assert.Equal(now1 + Interval, h.Service.NextDueUtc);
+        onDisk = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!;
+        Assert.Equal(new[] { NewestId }, onDisk.Applied);
+    }
+
+    [Fact]
+    public async Task Tick_CancelledMidApply_ReturnsCancelled_LeavesScheduleAlone()
+    {
+        // The rethrow clause: cancellation is not a failure. A tick treated as Failed would have re-armed to T0 + 30 min.
+        var dispatcher = new BlockingUiDispatcher();
+        Harness h = Build(Newest(), new AppState(), dispatcher: dispatcher);
+        using var cts = new CancellationTokenSource();
+
+        Task<TickResult> tick = h.Service.RunTickAsync(TickReason.Startup, cts.Token);
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        cts.Cancel();
+
+        Assert.Equal(TickResult.Cancelled, await tick.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Null(h.State.NextDueUtc);
+        Assert.Equal(0, LogCount("tick done"));
+        Assert.Equal(0, LogCount("tick failed"));
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.False(h.Service.IsTickRunning);
+
+        dispatcher.Release();   // nothing is left parked
+    }
 }
