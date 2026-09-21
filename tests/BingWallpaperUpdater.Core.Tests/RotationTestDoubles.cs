@@ -62,11 +62,14 @@ internal sealed class FakeApplier : IWallpaperApplier
     /// <summary>One-shot: the next <see cref="Apply"/> still counts the call and records the path, then throws this and clears it.</summary>
     public Exception? ThrowNext { get; set; }
 
+    /// <summary>Back to a clean applier: counters, paths and any still-armed one-shot failure (IN-10).</summary>
     public void Reset()
     {
         Calls = 0;
         LastPath = null;
         Paths.Clear();
+        FailNext = false;
+        ThrowNext = null;
     }
 
     public ApplyResult Apply(string absolutePath)
