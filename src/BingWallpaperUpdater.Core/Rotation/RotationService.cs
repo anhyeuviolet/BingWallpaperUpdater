@@ -99,14 +99,14 @@ public sealed class RotationService : IDisposable
     }
 
     /// <summary>
-    /// Any thread — raised after every tick once the gate is released (so a subscriber's <see cref="Snapshot"/> reads
-    /// <c>TickRunning == false</c>) and at the end of <see cref="ApplySettings"/>; never at gate acquisition. The
-    /// Settings window subscribes while open and marshals to its own thread (UI-04). A throwing handler is logged
-    /// and can never break the tick.
+    /// Any thread — raised after every tick and every re-apply once the gate is released (so a subscriber's
+    /// <see cref="Snapshot"/> reads <c>TickRunning == false</c>) and at the end of <see cref="ApplySettings"/> before
+    /// any forced re-apply it starts; never at gate acquisition. The Settings window subscribes while open and
+    /// marshals to its own thread (UI-04). A throwing handler is logged and can never break the tick.
     /// </summary>
     public event Action? StateChanged;
 
-    /// <summary>True while a tick holds the gate; the tray reads it to disable "Next wallpaper" (D-05).</summary>
+    /// <summary>True while a tick or a re-apply holds the gate; the tray reads it to disable "Next wallpaper" (D-05).</summary>
     public bool IsTickRunning => _gate.CurrentCount == 0;
 
     /// <summary>
@@ -306,18 +306,29 @@ public sealed class RotationService : IDisposable
 
         TrySaveState();
 
-        // A monitor-mode switch is visible within seconds, not at the next tick (criterion 2 "applies immediately"):
-        // per-monitor -> the plan over the current image; same -> the current image on every monitor. Forced, so the
-        // attached-set comparison does not suppress it; the gate still wins when a tick is in flight.
-        if (!string.Equals(_settings.MonitorMode, _appliedMonitorMode, StringComparison.Ordinal))
+        bool modeChanged;
+        lock (_sync)
         {
-            _appliedMonitorMode = _settings.MonitorMode;
-            _ = RunReapplyAsync("settings", force: true);
+            modeChanged = !string.Equals(_settings.MonitorMode, _appliedMonitorMode, StringComparison.Ordinal);
+            if (modeChanged)
+            {
+                _appliedMonitorMode = _settings.MonitorMode;
+            }
         }
 
         Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} resolution={_settings.Resolution} market={_settings.Market} monitors={_settings.MonitorMode} language={_settings.Language} next={ReadNextDue()?.ToString("O") ?? "-"}");
         Nudge("settings");
         RaiseStateChanged();
+
+        // A monitor-mode switch is visible within seconds, not at the next tick (criterion 2 "applies immediately"):
+        // per-monitor -> the plan over the current image; same -> the current image on every monitor. Forced, so the
+        // attached-set comparison does not suppress it; the gate still wins when a tick is in flight. Started LAST:
+        // the re-apply's own finally raises after its release, so the raise above reflects the schedule only and
+        // the window never observes a transient gate hold that nothing clears (CR-01).
+        if (modeChanged)
+        {
+            _ = RunReapplyAsync("settings", force: true);
+        }
     }
 
     /// <summary>
@@ -801,6 +812,7 @@ public sealed class RotationService : IDisposable
         finally
         {
             _gate.Release();
+            RaiseStateChanged();   // after the release: a subscriber's Snapshot() must read TickRunning == false (CR-01)
         }
     }
 

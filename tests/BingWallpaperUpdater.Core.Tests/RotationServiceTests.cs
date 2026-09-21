@@ -2068,6 +2068,75 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Contains("settings applied interval=60", LogText());
     }
 
+    // ---- Plan 03-06: gap closure (03-VERIFICATION gaps 1 and 2; 03-REVIEW CR-01 / WR-01) ------------------
+
+    [Fact]
+    public async Task ApplySettings_MonitorModeSwitch_StateChangedAfterReapplyRelease_ObservesTickRunningFalse()
+    {
+        // CR-01 on the real WinFormsUiDispatcher: the forced re-apply holds the gate across its UI hop, so the raise
+        // ApplySettings makes must precede the re-apply and the re-apply must raise again after its own release.
+        var dispatcher = new BlockingUiDispatcher();
+        Settings settings = Newest();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(settings, new AppState(), cache, applier: TwoMonitorApplier(), dispatcher: dispatcher);
+
+        Task<TickResult> startup = h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        dispatcher.Release();
+        Assert.Equal(TickResult.Applied, await startup.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal([NewestId], h.Cache.Index.Applied);
+        dispatcher.Rearm();
+
+        var observed = new List<bool>();
+        bool released = false;
+        var afterRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Service.StateChanged += () =>
+        {
+            bool running = h.Service.Snapshot().TickRunning;
+            lock (observed)
+            {
+                observed.Add(running);
+            }
+
+            if (Volatile.Read(ref released))
+            {
+                afterRelease.TrySetResult(running);
+            }
+        };
+
+        settings.MonitorMode = Settings.PerMonitorMode;
+        h.Service.ApplySettings();
+
+        lock (observed)
+        {
+            Assert.Equal([false], observed);   // the settings raise happened before the forced re-apply took the gate
+        }
+
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));   // the re-apply is parked at its UI hop
+        Assert.True(h.Service.IsTickRunning);
+        Assert.Empty(h.Applier.PerMonitorCalls);
+
+        Volatile.Write(ref released, true);
+        dispatcher.Release();
+        bool last = await afterRelease.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.False(last);
+        Assert.False(h.Service.IsTickRunning);
+        lock (observed)
+        {
+            Assert.Equal([false, false], observed);
+        }
+
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> call = Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(2, call.Count);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", call[0].AbsolutePath);
+        Assert.Contains(MiddleId, call[1].AbsolutePath);
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        string log = LogText();
+        Assert.Contains("reapply reason=settings monitors=2 result=Applied", log);
+        Assert.Contains("settings applied interval=30 mode=newest resolution=UHD market=en-US monitors=perMonitor", log);
+    }
+
     [Fact]
     public async Task OnDisplayChanged_AfterDispose_IsIgnored()
     {

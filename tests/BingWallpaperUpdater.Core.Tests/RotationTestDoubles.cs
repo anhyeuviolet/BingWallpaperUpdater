@@ -54,13 +54,23 @@ internal sealed class FakeMonitorLayout(IReadOnlyList<(int Width, int Height)> s
 /// </summary>
 internal sealed class BlockingUiDispatcher : IUiDispatcher
 {
-    private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Completes once a delegate has reached the dispatcher and is waiting.</summary>
+    /// <summary>Completes once a delegate has reached the dispatcher and is waiting (read it after <see cref="Rearm"/>, not before).</summary>
     public Task Entered => _entered.Task;
 
     public void Release() => _gate.TrySetResult();
+
+    /// <summary>
+    /// Fresh <see cref="Entered"/> and gate so the NEXT delegate parks again after an earlier <see cref="Release"/>
+    /// (a tick held at its apply, then a forced re-apply held at its hop). Call it only while no delegate is parked.
+    /// </summary>
+    public void Rearm()
+    {
+        _gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
 
     public async Task<T> InvokeAsync<T>(Func<T> func, CancellationToken ct)
     {
