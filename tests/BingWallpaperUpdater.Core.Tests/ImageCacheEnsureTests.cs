@@ -109,6 +109,38 @@ public sealed class ImageCacheEnsureTests : IDisposable
     }
 
     [Fact]
+    public async Task Ensure_HitWithoutDate_BackfillsDateFromTheCatalogEntry_AndSaves()
+    {
+        // IN-11: an entry cached while the catalog carried no date is repaired on the next hit for a dated row.
+        var index = new CacheIndex { Applied = [Id], Images = [Cached(Id, "UHD", "2026-09-20_AlphornBavaria.jpg")] };
+        index.Images[0].Date = null;
+        AtomicJsonFile.Save(_indexPath, index, CoreJsonContext.Default.CacheIndex);
+        File.WriteAllBytes(Path.Combine(_dir, "2026-09-20_AlphornBavaria.jpg"), new byte[16]);
+        var cache = new ImageCache(_dir, _indexPath);
+        cache.Load();
+
+        CachedImage? hit = await cache.EnsureAsync(Entry(), "UHD", _http, CancellationToken.None);
+
+        Assert.NotNull(hit);
+        Assert.Equal("2026-09-20", hit!.Date);
+        Assert.Equal("2026-09-20", AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!.Images[0].Date);
+        Assert.Contains($"cache hit id={Id}", LogText());
+    }
+
+    [Fact]
+    public async Task Ensure_HitWithDate_UndatedCatalogEntry_LeavesTheStoredDateAlone()
+    {
+        ImageCache cache = SeededCache();
+        CatalogEntry undated = Entry() with { Date = null };
+        DateTime writtenBefore = File.GetLastWriteTimeUtc(_indexPath);
+
+        CachedImage? hit = await cache.EnsureAsync(undated, "UHD", _http, CancellationToken.None);
+
+        Assert.Equal("2026-09-20", hit!.Date);
+        Assert.Equal(writtenBefore, File.GetLastWriteTimeUtc(_indexPath));   // no save on a hit that changes nothing
+    }
+
+    [Fact]
     public async Task Ensure_SameIdDifferentResolution_IsAMissThatReachesTheHandler()
     {
         ImageCache cache = SeededCache();

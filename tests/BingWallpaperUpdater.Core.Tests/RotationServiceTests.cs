@@ -616,6 +616,7 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
         Assert.Contains("catalog source=hpimagearchive", LogText());
         Assert.Contains("tick done reason=Interval result=Applied decision=ApplyNew why=new", LogText());
+        Assert.Equal("2026-09-20", h.Cache.Index.Images.Single(i => i.Id == FreshId).Date);   // IN-11: archive rows carry Bing's enddate
 
         catalog.GitHubOnline = true;                         // README still on yesterday's NewestId
         await AdvanceAsync(h, Interval);                     // T0 + 60

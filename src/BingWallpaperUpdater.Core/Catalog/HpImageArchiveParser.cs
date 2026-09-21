@@ -46,7 +46,7 @@ public static class HpImageArchiveParser
 
             entries.Add(new CatalogEntry(
                 Id: id,
-                Date: null,
+                Date: IsoDate(image.EndDate),   // the README date is Bing's enddate (CLAUDE.md): "20260920" -> "2026-09-20" (IN-11)
                 StartDate: NullIfBlank(image.StartDate),
                 Title: NullIfBlank(image.Title),
                 Copyright: NullIfBlank(image.Copyright),
@@ -59,4 +59,13 @@ public static class HpImageArchiveParser
 
     /// <summary>Missing, empty or whitespace-only metadata is stored as null, never as "" (SRC-05 empty edge).</summary>
     private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    /// <summary>
+    /// <c>yyyyMMdd</c> -> <c>yyyy-MM-dd</c>, the README's date shape, so archive-sourced entries order and name their
+    /// files exactly like README rows; anything else (missing, malformed) stays null. Shape check only — no parsing.
+    /// </summary>
+    private static string? IsoDate(string? compact) =>
+        compact is { Length: 8 } && compact.All(char.IsAsciiDigit)
+            ? $"{compact[..4]}-{compact[4..6]}-{compact[6..8]}"
+            : null;
 }

@@ -115,6 +115,14 @@ public sealed class ImageCache
 
         if (TryGet(entry.Id, resolution) is { } hit && File.Exists(Path.Combine(_cacheDir, hit.File)))
         {
+            // An entry cached from a catalog that carried no date (an older build's archive rows) is repaired once
+            // a dated row for the same ID comes by, so it orders correctly among the candidates (IN-11).
+            if (hit.Date is null && entry.Date is not null)
+            {
+                hit.Date = entry.Date;
+                Save();
+            }
+
             Log.Info($"cache hit id={hit.Id} file={hit.File}");
             return hit;
         }

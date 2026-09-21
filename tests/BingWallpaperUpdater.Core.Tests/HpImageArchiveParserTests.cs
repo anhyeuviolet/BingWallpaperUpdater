@@ -25,8 +25,26 @@ public sealed class HpImageArchiveParserTests
             Assert.False(string.IsNullOrWhiteSpace(e.Copyright));
             Assert.NotNull(e.StartDate);
             Assert.Matches(@"^\d{8}$", e.StartDate);
-            Assert.Null(e.Date);
+            Assert.NotNull(e.Date);
+            Assert.Matches(@"^\d{4}-\d{2}-\d{2}$", e.Date);
         });
+        // IN-11: Date is Bing's enddate in README shape — the same date README.sample.md carries for these IDs.
+        Assert.Equal("2026-09-20", entries[0].Date);
+        Assert.Equal("2026-09-17", entries.Single(e => e.Id.Value == "OHR.IcyCubs_EN-US5222104616").Date);
+        Assert.Equal("2026-09-14", entries.Single(e => e.Id.Value == "OHR.MisurinaPeak_EN-US4897144498").Date);
+    }
+
+    [Theory]
+    [InlineData("{\"images\":[{\"urlbase\":\"/th?id=OHR.NoEnd_EN-US1111111111\"}]}")]
+    [InlineData("{\"images\":[{\"enddate\":\"\",\"urlbase\":\"/th?id=OHR.NoEnd_EN-US1111111111\"}]}")]
+    [InlineData("{\"images\":[{\"enddate\":\"2026-09-20\",\"urlbase\":\"/th?id=OHR.NoEnd_EN-US1111111111\"}]}")]
+    [InlineData("{\"images\":[{\"enddate\":\"2026092\",\"urlbase\":\"/th?id=OHR.NoEnd_EN-US1111111111\"}]}")]
+    [InlineData("{\"images\":[{\"enddate\":\"2026092O\",\"urlbase\":\"/th?id=OHR.NoEnd_EN-US1111111111\"}]}")]
+    public void Parse_MissingOrMalformedEndDate_DateStaysNull(string json)
+    {
+        CatalogEntry entry = Assert.Single(HpImageArchiveParser.Parse(json));
+
+        Assert.Null(entry.Date);
     }
 
     [Fact]
@@ -101,6 +119,7 @@ public sealed class HpImageArchiveParserTests
         CatalogEntry entry = Assert.Single(HpImageArchiveParser.Parse(json));
 
         Assert.Equal("00000101", entry.StartDate);
+        Assert.Equal("9999-12-31", entry.Date);   // shape only, never parsed as a calendar date
     }
 
     [Fact]
