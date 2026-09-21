@@ -2138,6 +2138,132 @@ public sealed class RotationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task ApplySettings_MonitorModeSwitch_WhileTickRunning_LogsBusy_ThenReappliesAfterTickReleasesGate()
+    {
+        // WR-01 busy case: the switch lands while a tick holds the gate (Next click, download in flight). It is not
+        // lost: the tick's finally re-checks the pending mode after its release and runs the forced re-apply then.
+        var dispatcher = new BlockingUiDispatcher();
+        Settings settings = Newest();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(settings, new AppState(), cache, applier: TwoMonitorApplier(), dispatcher: dispatcher);
+
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Service.StateChanged += () =>
+        {
+            // The tick's own raise sees zero per-monitor calls; only the follow-up re-apply's post-release raise matches.
+            if (h.Applier.PerMonitorCalls.Count == 1 && !h.Service.IsTickRunning)
+            {
+                done.TrySetResult();
+            }
+        };
+
+        Task<TickResult> tick = h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));   // parked at its single-mode apply, branch already chosen
+
+        settings.MonitorMode = Settings.PerMonitorMode;
+        h.Service.ApplySettings();
+
+        Assert.Equal(1, LogCount("reapply skipped reason=settings cause=busy"));
+        Assert.Empty(h.Applier.PerMonitorCalls);
+        Assert.Equal(0, LogCount("reapply reason=settings"));
+
+        dispatcher.Release();
+        Assert.Equal(TickResult.Applied, await tick.WaitAsync(TimeSpan.FromSeconds(10)));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> call = Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(2, call.Count);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", call[0].AbsolutePath);
+        Assert.Contains(MiddleId, call[1].AbsolutePath);
+        Assert.Equal(2, h.Applier.Calls);   // the tick's single apply plus the per-monitor follow-up
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        Assert.Equal(1, LogCount("reapply reason=settings monitors=2 result=Applied"));
+        Assert.False(h.Service.IsTickRunning);
+        string log = LogText();
+        int tickDone = log.IndexOf("tick done reason=Startup", StringComparison.Ordinal);
+        int reapplied = log.IndexOf("reapply reason=settings monitors=2", StringComparison.Ordinal);
+        Assert.True(tickDone >= 0 && reapplied > tickDone, "the follow-up re-apply must run after the tick ended");
+
+        // Committed by the follow-up: an unchanged ApplySettings re-runs nothing.
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+        Assert.Equal(1, LogCount("reapply reason=settings monitors=2"));
+    }
+
+    [Fact]
+    public async Task ApplySettings_MonitorModeSwitch_ReapplyFails_ModeNotCommitted_NextApplySettingsRetries()
+    {
+        // WR-01 failed case: a COM failure leaves the desktop in the old mode, so the mode must stay uncommitted and
+        // the next ApplySettings must retry (and the failed re-apply still raises after its release).
+        Settings settings = Newest();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);
+        Harness h = Build(settings, new AppState(), cache, applier: TwoMonitorApplier());
+        await StartAsync(h);
+        int raised = 0;
+        int runningWhenRaised = 0;
+        h.Service.StateChanged += () =>
+        {
+            Interlocked.Increment(ref raised);
+            if (h.Service.Snapshot().TickRunning)
+            {
+                Interlocked.Increment(ref runningWhenRaised);
+            }
+        };
+
+        h.Applier.FailNext = true;
+        settings.MonitorMode = Settings.PerMonitorMode;
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+
+        Assert.Equal(1, LogCount("reapply reason=settings monitors=2 result=Failed"));
+        Assert.Equal([NewestId], h.Cache.Index.Applied);   // RunPerMonitor restored the previous Applied list
+        Assert.Equal(2, raised);                            // the settings raise + the failed re-apply's post-release raise
+        Assert.Equal(0, runningWhenRaised);
+
+        h.Service.ApplySettings();                          // nothing else changed: the uncommitted switch is retried
+        await h.Service.WaitForIdleAsync();
+
+        Assert.Equal(1, LogCount("reapply reason=settings monitors=2 result=Applied"));
+        Assert.Equal(2, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        Assert.Equal(4, raised);
+        Assert.Equal(0, runningWhenRaised);
+    }
+
+    [Fact]
+    public async Task ApplySettings_MonitorModeSwitch_NoCurrent_NotCommitted_FirstApplyingTickUsesNewMode()
+    {
+        // WR-01 no-current case: a switch before anything was applied commits nothing; the first tick that applies
+        // uses the live mode and commits it, after which ApplySettings has nothing to re-apply.
+        var network = new Network { Online = false };
+        Settings settings = Newest();
+        Harness h = Build(settings, new AppState(), fake: Switchable(network), applier: TwoMonitorApplier());
+        await StartAsync(h);                                // the Startup tick fails: nothing current
+        Assert.Null(h.State.CurrentImageId);
+
+        settings.MonitorMode = Settings.PerMonitorMode;
+        h.Service.ApplySettings();
+        await h.Service.WaitForIdleAsync();
+
+        Assert.Equal(1, LogCount("reapply skipped reason=settings cause=no-current"));
+        Assert.Equal(0, h.Applier.Calls);
+
+        network.Online = true;
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));     // the first Retry tick fetches and applies in the live per-monitor mode
+
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> call = Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal(2, call.Count);
+        Assert.Equal(call[0].AbsolutePath, call[1].AbsolutePath);   // one cached image: same on all
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+
+        h.Service.ApplySettings();                          // the tick committed the mode: nothing to re-apply
+        await h.Service.WaitForIdleAsync();
+
+        Assert.Equal(0, LogCount("reapply reason=settings"));
+        Assert.Equal(1, LogCount("reapply skipped reason=settings"));
+    }
+
+    [Fact]
     public async Task OnDisplayChanged_AfterDispose_IsIgnored()
     {
         Harness h = await PerMonitorAppliedAsync();
