@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Runtime.Versioning;
 using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Io;
+using BingWallpaperUpdater.Core.Model;
 
 namespace BingWallpaperUpdater.App;
 
@@ -13,23 +14,48 @@ internal static class Program
     /// <summary>Per-session single-instance guard; Phase 4's installer uses the same name as AppMutex.</summary>
     private const string MutexName = @"Local\BingWallpaperUpdater";
 
+    /// <summary>
+    /// "Show Settings" signal, session-scoped like the mutex (UI-06): a second launch sets it and exits, the primary
+    /// instance waits on it and opens or activates the one Settings window. No HWND broadcast, no pipe.
+    /// </summary>
+    private const string ShowEventName = @"Local\BingWallpaperUpdater.Show";
+
     /// <summary>Autostart flag written into the HKCU Run value by Phase 3 (D-12); matched case-insensitively, no value.</summary>
     private const string StartupFlag = "--startup";
 
     [STAThread]
     private static int Main(string[] args)
     {
-        // A second launch must exit immediately: no log line, no network, no cache access (SRC-09).
+        // A second launch must exit immediately: no log line, no network, no cache access (SRC-09). Its only effect
+        // is the Show signal to the primary (UI-06).
         using var mutex = new Mutex(initiallyOwned: true, MutexName, out bool createdNew);
         if (!createdNew && !TryAcquireExisting(mutex))
         {
+            if (EventWaitHandle.TryOpenExisting(ShowEventName, out EventWaitHandle? show))
+            {
+                using (show)
+                {
+                    show.Set();
+                }
+            }
+
             return 0;
         }
+
+        // Created right after the mutex (Pitfall 12) so a second launch during startup finds it; owned here for the
+        // process lifetime — the context registers a wait on it but never disposes it.
+        using var showEvent = new EventWaitHandle(initialState: false, EventResetMode.AutoReset, ShowEventName, out _);
 
         AppPaths.EnsureDirectories();
         Log.Initialize(AppPaths.LogPath);
 
+        // Settings and the UI culture come before the first WinForms control (Pitfall 4): the tray menu is built in
+        // the context constructor and must already read the right resource set.
+        Settings settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
+        UiCulture.Apply(settings.Language);
+
         ApplicationConfiguration.Initialize();
+        Application.SetColorMode(SystemColorMode.System);   // .NET 10 stable API; Windows 11 only, light on Windows 10
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
         TrayApplicationContext? context = null;
@@ -48,7 +74,7 @@ internal static class Program
         bool startup = args.Any(a => string.Equals(a, StartupFlag, StringComparison.OrdinalIgnoreCase));
 
         Log.Info($"startup version={InformationalVersion()} pid={Environment.ProcessId}");
-        context = new TrayApplicationContext(startup);
+        context = new TrayApplicationContext(settings, showEvent, startup);
         Application.Run(context);
         return 0;
     }

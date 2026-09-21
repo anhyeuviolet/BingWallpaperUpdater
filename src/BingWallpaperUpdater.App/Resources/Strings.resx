@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!--
+    Neutral (English) UI strings for the tray menu and the Settings window (L10N-01).
+    Every key here must also exist in Strings.vi.resx; tests/ResxParityTests enforces the parity.
+    Looked up through Resources/Strings.cs (Strings.Get(key)); a missing key renders the key text itself.
+  -->
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="Form_Title" xml:space="preserve">
+    <value>Bing Wallpaper Updater</value>
+  </data>
+  <data name="Tray_Tooltip" xml:space="preserve">
+    <value>Bing Wallpaper Updater</value>
+  </data>
+  <data name="Menu_Next" xml:space="preserve">
+    <value>Next wallpaper</value>
+  </data>
+  <data name="Menu_Settings" xml:space="preserve">
+    <value>Settings</value>
+  </data>
+  <data name="Menu_Exit" xml:space="preserve">
+    <value>Exit</value>
+  </data>
+  <data name="Label_Interval" xml:space="preserve">
+    <value>Check every</value>
+  </data>
+  <data name="Interval_30" xml:space="preserve">
+    <value>30 minutes</value>
+  </data>
+  <data name="Interval_60" xml:space="preserve">
+    <value>1 hour</value>
+  </data>
+  <data name="Interval_120" xml:space="preserve">
+    <value>2 hours</value>
+  </data>
+  <data name="Interval_240" xml:space="preserve">
+    <value>4 hours</value>
+  </data>
+  <data name="Interval_480" xml:space="preserve">
+    <value>8 hours</value>
+  </data>
+  <data name="Interval_1440" xml:space="preserve">
+    <value>Once a day</value>
+  </data>
+  <data name="Label_Mode" xml:space="preserve">
+    <value>Rotation</value>
+  </data>
+  <data name="Mode_Newest" xml:space="preserve">
+    <value>Newest image</value>
+  </data>
+  <data name="Mode_Random" xml:space="preserve">
+    <value>Random from cache</value>
+  </data>
+  <data name="Label_Resolution" xml:space="preserve">
+    <value>Resolution</value>
+  </data>
+  <data name="Resolution_Auto" xml:space="preserve">
+    <value>Auto (largest monitor)</value>
+  </data>
+  <data name="Resolution_UHD" xml:space="preserve">
+    <value>UHD 3840×2160</value>
+  </data>
+  <data name="Resolution_1920x1200" xml:space="preserve">
+    <value>1920×1200</value>
+  </data>
+  <data name="Resolution_1920x1080" xml:space="preserve">
+    <value>1920×1080</value>
+  </data>
+  <data name="Label_Market" xml:space="preserve">
+    <value>Bing region</value>
+  </data>
+  <data name="Label_Monitors" xml:space="preserve">
+    <value>Monitors</value>
+  </data>
+  <data name="Monitors_Same" xml:space="preserve">
+    <value>Same image on every monitor</value>
+  </data>
+  <data name="Monitors_PerMonitor" xml:space="preserve">
+    <value>A different image on each monitor</value>
+  </data>
+  <data name="Check_Autostart" xml:space="preserve">
+    <value>Start with Windows</value>
+  </data>
+  <data name="Label_Language" xml:space="preserve">
+    <value>Language</value>
+  </data>
+  <data name="Language_Auto" xml:space="preserve">
+    <value>Windows display language</value>
+  </data>
+  <data name="Language_En" xml:space="preserve">
+    <value>English</value>
+  </data>
+  <data name="Language_Vi" xml:space="preserve">
+    <value>Tiếng Việt</value>
+  </data>
+  <data name="Group_Current" xml:space="preserve">
+    <value>Current image</value>
+  </data>
+  <data name="Label_Title" xml:space="preserve">
+    <value>Title</value>
+  </data>
+  <data name="Label_Copyright" xml:space="preserve">
+    <value>Copyright</value>
+  </data>
+  <data name="Label_Date" xml:space="preserve">
+    <value>Date</value>
+  </data>
+  <data name="Label_LastChecked" xml:space="preserve">
+    <value>Last checked</value>
+  </data>
+  <data name="Label_NextCheck" xml:space="preserve">
+    <value>Next check</value>
+  </data>
+  <data name="Label_LastError" xml:space="preserve">
+    <value>Last error</value>
+  </data>
+  <data name="Error_Fetch" xml:space="preserve">
+    <value>Could not reach Bing; will retry</value>
+  </data>
+  <data name="Error_Apply" xml:space="preserve">
+    <value>Could not set the wallpaper</value>
+  </data>
+  <data name="Error_ReadBack" xml:space="preserve">
+    <value>Another app changed the wallpaper (Windows Spotlight?)</value>
+  </data>
+  <data name="Button_Next" xml:space="preserve">
+    <value>Next wallpaper</value>
+  </data>
+  <data name="Button_OpenCache" xml:space="preserve">
+    <value>Open cache folder</value>
+  </data>
+  <data name="Status_Checking" xml:space="preserve">
+    <value>Checking…</value>
+  </data>
+</root>

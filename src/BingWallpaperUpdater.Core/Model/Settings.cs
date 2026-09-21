@@ -19,9 +19,16 @@ public sealed partial class Settings
     public const int DefaultIntervalMinutes = 30;
     public const string DefaultMode = "newest";
     public const string RandomMode = "random";
+    public const string AutoLanguage = "auto";
 
     /// <summary>The resolutions the pipeline knows how to request and validate (see <c>BingImageUrl.MinDimensions</c>).</summary>
     public static readonly IReadOnlyList<string> KnownResolutions = ["UHD", "1920x1200", "1920x1080"];
+
+    /// <summary>
+    /// UI language choices (L10N-02, L10N-03): <c>auto</c> follows the Windows display language (en or vi, else en),
+    /// <c>en</c> / <c>vi</c> force one. Resolved by <c>LanguageResolver</c>; never used to derive <see cref="Market"/>.
+    /// </summary>
+    public static readonly IReadOnlyList<string> KnownLanguages = ["auto", "en", "vi"];
 
     /// <summary>
     /// The rotation intervals the scheduler accepts, in minutes (ROT-01): 30 min, 1 h, 2 h, 4 h, 8 h, daily. Anything
@@ -46,6 +53,12 @@ public sealed partial class Settings
 
     /// <summary><c>newest</c> (default) or <c>random</c>, canonical lower case (D-08).</summary>
     public string Mode { get; set; } = DefaultMode;
+
+    /// <summary>
+    /// UI language: <c>auto</c> (default), <c>en</c> or <c>vi</c>, canonical lower case. Applied once at startup and
+    /// again when changed in the window; a Phase 1/2 file without the field loads as <c>auto</c>.
+    /// </summary>
+    public string Language { get; set; } = AutoLanguage;
 
     /// <summary>The interval as a <see cref="TimeSpan"/>; computed, never serialised.</summary>
     [JsonIgnore]
@@ -150,6 +163,22 @@ public sealed partial class Settings
         else if (!string.Equals(knownMode, Mode, StringComparison.Ordinal))
         {
             Mode = knownMode;
+            changed = true;
+        }
+
+        string? language = Language?.Trim();
+        string? knownLanguage = language is null
+            ? null
+            : KnownLanguages.FirstOrDefault(l => string.Equals(l, language, StringComparison.OrdinalIgnoreCase));
+        if (knownLanguage is null)
+        {
+            Log.Warn($"settings invalid field=Language value={Describe(Language)} using={AutoLanguage}");
+            Language = AutoLanguage;
+            changed = true;
+        }
+        else if (!string.Equals(knownLanguage, Language, StringComparison.Ordinal))
+        {
+            Language = knownLanguage;
             changed = true;
         }
 

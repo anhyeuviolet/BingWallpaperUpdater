@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!--
+    Vietnamese UI strings (L10N-01); compiled into vi\BingWallpaperUpdater.resources.dll.
+    Same key set as Strings.resx (enforced by tests/ResxParityTests); values are precomposed (NFC) Unicode so
+    Segoe UI renders the diacritics as single glyphs. Saved as UTF-8.
+  -->
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="Form_Title" xml:space="preserve">
+    <value>Bing Wallpaper Updater</value>
+  </data>
+  <data name="Tray_Tooltip" xml:space="preserve">
+    <value>Bing Wallpaper Updater</value>
+  </data>
+  <data name="Menu_Next" xml:space="preserve">
+    <value>Hình nền tiếp theo</value>
+  </data>
+  <data name="Menu_Settings" xml:space="preserve">
+    <value>Cài đặt</value>
+  </data>
+  <data name="Menu_Exit" xml:space="preserve">
+    <value>Thoát</value>
+  </data>
+  <data name="Label_Interval" xml:space="preserve">
+    <value>Kiểm tra mỗi</value>
+  </data>
+  <data name="Interval_30" xml:space="preserve">
+    <value>30 phút</value>
+  </data>
+  <data name="Interval_60" xml:space="preserve">
+    <value>1 giờ</value>
+  </data>
+  <data name="Interval_120" xml:space="preserve">
+    <value>2 giờ</value>
+  </data>
+  <data name="Interval_240" xml:space="preserve">
+    <value>4 giờ</value>
+  </data>
+  <data name="Interval_480" xml:space="preserve">
+    <value>8 giờ</value>
+  </data>
+  <data name="Interval_1440" xml:space="preserve">
+    <value>Mỗi ngày một lần</value>
+  </data>
+  <data name="Label_Mode" xml:space="preserve">
+    <value>Cách xoay ảnh</value>
+  </data>
+  <data name="Mode_Newest" xml:space="preserve">
+    <value>Ảnh mới nhất</value>
+  </data>
+  <data name="Mode_Random" xml:space="preserve">
+    <value>Ngẫu nhiên từ bộ nhớ đệm</value>
+  </data>
+  <data name="Label_Resolution" xml:space="preserve">
+    <value>Độ phân giải</value>
+  </data>
+  <data name="Resolution_Auto" xml:space="preserve">
+    <value>Tự động (theo màn hình lớn nhất)</value>
+  </data>
+  <data name="Resolution_UHD" xml:space="preserve">
+    <value>UHD 3840×2160</value>
+  </data>
+  <data name="Resolution_1920x1200" xml:space="preserve">
+    <value>1920×1200</value>
+  </data>
+  <data name="Resolution_1920x1080" xml:space="preserve">
+    <value>1920×1080</value>
+  </data>
+  <data name="Label_Market" xml:space="preserve">
+    <value>Khu vực Bing</value>
+  </data>
+  <data name="Label_Monitors" xml:space="preserve">
+    <value>Màn hình</value>
+  </data>
+  <data name="Monitors_Same" xml:space="preserve">
+    <value>Cùng một ảnh trên mọi màn hình</value>
+  </data>
+  <data name="Monitors_PerMonitor" xml:space="preserve">
+    <value>Mỗi màn hình một ảnh khác nhau</value>
+  </data>
+  <data name="Check_Autostart" xml:space="preserve">
+    <value>Khởi động cùng Windows</value>
+  </data>
+  <data name="Label_Language" xml:space="preserve">
+    <value>Ngôn ngữ</value>
+  </data>
+  <data name="Language_Auto" xml:space="preserve">
+    <value>Theo ngôn ngữ hiển thị của Windows</value>
+  </data>
+  <data name="Language_En" xml:space="preserve">
+    <value>English</value>
+  </data>
+  <data name="Language_Vi" xml:space="preserve">
+    <value>Tiếng Việt</value>
+  </data>
+  <data name="Group_Current" xml:space="preserve">
+    <value>Ảnh hiện tại</value>
+  </data>
+  <data name="Label_Title" xml:space="preserve">
+    <value>Tiêu đề</value>
+  </data>
+  <data name="Label_Copyright" xml:space="preserve">
+    <value>Bản quyền</value>
+  </data>
+  <data name="Label_Date" xml:space="preserve">
+    <value>Ngày</value>
+  </data>
+  <data name="Label_LastChecked" xml:space="preserve">
+    <value>Kiểm tra lần cuối</value>
+  </data>
+  <data name="Label_NextCheck" xml:space="preserve">
+    <value>Kiểm tra tiếp theo</value>
+  </data>
+  <data name="Label_LastError" xml:space="preserve">
+    <value>Lỗi gần nhất</value>
+  </data>
+  <data name="Error_Fetch" xml:space="preserve">
+    <value>Không kết nối được Bing; sẽ thử lại</value>
+  </data>
+  <data name="Error_Apply" xml:space="preserve">
+    <value>Không đặt được hình nền</value>
+  </data>
+  <data name="Error_ReadBack" xml:space="preserve">
+    <value>Ứng dụng khác đã đổi hình nền (Windows Spotlight?)</value>
+  </data>
+  <data name="Button_Next" xml:space="preserve">
+    <value>Hình nền tiếp theo</value>
+  </data>
+  <data name="Button_OpenCache" xml:space="preserve">
+    <value>Mở thư mục bộ nhớ đệm</value>
+  </data>
+  <data name="Status_Checking" xml:space="preserve">
+    <value>Đang kiểm tra…</value>
+  </data>
+</root>
