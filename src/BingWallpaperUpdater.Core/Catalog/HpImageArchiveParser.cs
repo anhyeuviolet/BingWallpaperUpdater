@@ -48,7 +48,7 @@ public static class HpImageArchiveParser
                 Id: id,
                 Date: IsoDate(image.EndDate),   // the README date is Bing's enddate (CLAUDE.md): "20260920" -> "2026-09-20" (IN-11)
                 StartDate: NullIfBlank(image.StartDate),
-                Title: NullIfBlank(image.Title),
+                Title: TitleOrNull(image.Title),
                 Copyright: NullIfBlank(image.Copyright),
                 CopyrightLink: NullIfBlank(image.CopyrightLink),
                 Source: CatalogSources.HpImageArchive));
@@ -59,6 +59,14 @@ public static class HpImageArchiveParser
 
     /// <summary>Missing, empty or whitespace-only metadata is stored as null, never as "" (SRC-05 empty edge).</summary>
     private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    /// <summary>
+    /// Like <see cref="NullIfBlank"/>, plus the literal <c>"Info"</c> that HPImageArchive returns as the title of
+    /// every <c>ROW</c> (rest-of-world) image is stored as null so the window shows a blank title (SRC-04); the
+    /// copyright of those rows is real and is kept through <see cref="NullIfBlank"/>.
+    /// </summary>
+    private static string? TitleOrNull(string? value) =>
+        NullIfBlank(value) is { } title && !string.Equals(title.Trim(), "Info", StringComparison.Ordinal) ? title : null;
 
     /// <summary>
     /// <c>yyyyMMdd</c> -> <c>yyyy-MM-dd</c>, the README's date shape, so archive-sourced entries order and name their

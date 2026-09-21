@@ -8,7 +8,7 @@ namespace BingWallpaperUpdater.Core.Tests;
 public sealed class CacheFileNameTests
 {
     private static readonly DateTimeOffset Now = new(2026, 9, 21, 3, 0, 0, TimeSpan.Zero);
-    private static readonly Regex Shape = new(@"^[0-9]{4}-[0-9]{2}-[0-9]{2}_[A-Za-z0-9]+_[A-Z]{2}-[A-Z]{2}[0-9]+(\.[0-9]+x[0-9]+)?\.jpg$", RegexOptions.CultureInvariant);
+    private static readonly Regex Shape = new(@"^[0-9]{4}-[0-9]{2}-[0-9]{2}_[A-Za-z0-9]+_([A-Z]{2}-[A-Z]{2}|ROW)[0-9]+(\.[0-9]+x[0-9]+)?\.jpg$", RegexOptions.CultureInvariant);
 
     private static CatalogEntry Entry(string id = "OHR.AlphornBavaria_EN-US6200857270", string? date = "2026-09-20", string? startDate = "20260919")
     {
@@ -71,6 +71,39 @@ public sealed class CacheFileNameTests
         Assert.Equal("34", id.Digits);
     }
 
+    /// <summary>SRC-04: Bing answers en-AU / vi-VN with the "rest of world" pseudo-market ROW; the ID must parse and keep ROW as its market.</summary>
+    [Fact]
+    public void TryParse_RowMarket_ParsesAndKeepsRowAsMarket()
+    {
+        Assert.True(ImageId.TryParse("OHR.ParisSunset_ROW1775373883", out ImageId id));
+
+        Assert.Equal("ROW", id.Market);
+        Assert.Equal("ParisSunset", id.Name);
+        Assert.Equal("1775373883", id.Digits);
+    }
+
+    /// <summary>The widened market group is a bounded literal alternation (T-03-08): near-misses of ROW are still rejected.</summary>
+    [Theory]
+    [InlineData("OHR.X_RO1")]
+    [InlineData("OHR.X_ROWW1")]
+    [InlineData("OHR.X_row1")]
+    [InlineData("OHR.X_ROW")]
+    [InlineData("OHR.X_RO-W1")]
+    public void TryParse_RowNearMisses_AreRejected(string text)
+    {
+        Assert.False(ImageId.TryParse(text, out _));
+    }
+
+    /// <summary>A ROW ID lands in the cache under the same stem rule; every character is in the safe set, so CacheFileName needs no change.</summary>
+    [Fact]
+    public void For_RowMarket_ProducesValidFileName()
+    {
+        CatalogEntry entry = Entry("OHR.ParisSunset_ROW1775373883", date: "2026-09-21", startDate: "20260920");
+
+        Assert.Equal("2026-09-21_ParisSunset_ROW1775373883.jpg", CacheFileName.For(entry, "UHD", Now));
+        Assert.Equal("2026-09-21_ParisSunset_ROW1775373883.1920x1080.jpg", CacheFileName.For(entry, "1920x1080", Now));
+    }
+
     [Theory]
     [InlineData("2026-09-20", "20260919", "2026-09-20")]
     [InlineData("", "20260919", "2026-09-19")]
@@ -90,6 +123,8 @@ public sealed class CacheFileNameTests
     [InlineData("OHR.A_EN-US1", "UHD")]
     [InlineData("OHR.Abc123XYZ_DE-DE0", "1920x1200")]
     [InlineData("OHR.x9_ZH-CN99999999999999999999", "UHD")]
+    [InlineData("OHR.ParisSunset_ROW1775373883", "UHD")]
+    [InlineData("OHR.ParisSunset_ROW1775373883", "1920x1200")]
     public void For_AlwaysMatchesTheSafeShape_ForEveryAcceptedImageId(string id, string resolution)
     {
         string name = CacheFileName.For(Entry(id), resolution, Now);

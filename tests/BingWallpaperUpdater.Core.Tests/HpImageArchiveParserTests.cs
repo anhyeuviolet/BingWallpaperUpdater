@@ -111,6 +111,41 @@ public sealed class HpImageArchiveParserTests
         Assert.Null(entry.CopyrightLink);
     }
 
+    /// <summary>
+    /// SRC-04: a ROW row as returned live for mkt=en-AU / vi-VN (2026-09-21). The ID parses, the literal title "Info"
+    /// is stored as null (blank in the window), and the real copyright is kept.
+    /// </summary>
+    [Theory]
+    [InlineData("{\"images\":[{\"startdate\":\"20260920\",\"enddate\":\"20260921\",\"urlbase\":\"/th?id=OHR.ParisSunset_ROW1775373883\",\"title\":\"Info\",\"copyright\":\"Eiffel Tower at sunset, Paris, France (\\u00a9 Alexander Spatari/Getty Images)\",\"copyrightlink\":\"https://www.bing.com/search?q=Eiffel+Tower\"}]}")]
+    [InlineData("{\"images\":[{\"enddate\":\"20260921\",\"urlbase\":\"/th?id=OHR.ParisSunset_ROW1775373883\",\"title\":\" Info \",\"copyright\":\"Eiffel Tower at sunset, Paris, France (\\u00a9 Alexander Spatari/Getty Images)\"}]}")]
+    public void Parse_RowRow_ParsesWithNullTitleAndKeptCopyright(string json)
+    {
+        CatalogEntry entry = Assert.Single(HpImageArchiveParser.Parse(json));
+
+        Assert.Equal("OHR.ParisSunset_ROW1775373883", entry.Id.Value);
+        Assert.Equal("ROW", entry.Id.Market);
+        Assert.Null(entry.Title);
+        Assert.Equal("Eiffel Tower at sunset, Paris, France (© Alexander Spatari/Getty Images)", entry.Copyright);
+        Assert.Equal("2026-09-21", entry.Date);
+        Assert.Equal(CatalogSources.HpImageArchive, entry.Source);
+    }
+
+    /// <summary>Only the exact literal "Info" is dropped; a real title (including one that merely contains or resembles it) is kept unchanged.</summary>
+    [Theory]
+    [InlineData("The tower that won Paris over", "The tower that won Paris over")]
+    [InlineData("Info about Paris", "Info about Paris")]
+    [InlineData("info", "info")]
+    [InlineData("Information", "Information")]
+    public void Parse_RealTitle_IsKeptUnchanged(string title, string expected)
+    {
+        string json = "{\"images\":[{\"urlbase\":\"/th?id=OHR.ParisSunset_ROW1775373883\",\"title\":\"" + title + "\",\"copyright\":\"c\"}]}";
+
+        CatalogEntry entry = Assert.Single(HpImageArchiveParser.Parse(json));
+
+        Assert.Equal(expected, entry.Title);
+        Assert.Equal("c", entry.Copyright);
+    }
+
     [Fact]
     public void Parse_KeepsStartDateAsRawString()
     {
