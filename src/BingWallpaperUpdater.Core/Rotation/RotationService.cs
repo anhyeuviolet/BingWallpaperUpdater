@@ -389,14 +389,24 @@ public sealed class RotationService : IDisposable
         }
 
         Log.Info("display changed");
-        try
+
+        // The timer reference is taken under _sync, where Dispose also nulls it (WR-03): a signal that passed the
+        // _disposed check above can no longer dereference a field Dispose has just cleared. The Change call itself
+        // stays outside the lock; if Dispose won the race it throws ObjectDisposedException, handled below.
+        ITimer timer;
+        lock (_sync)
         {
-            lock (_sync)
+            if (_disposed)
             {
-                _displayTimer ??= _time.CreateTimer(_ => OnDisplayDebounce(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                return;
             }
 
-            _displayTimer.Change(ScheduleMath.DisplayChangeDebounce, Timeout.InfiniteTimeSpan);
+            timer = _displayTimer ??= _time.CreateTimer(_ => OnDisplayDebounce(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        }
+
+        try
+        {
+            timer.Change(ScheduleMath.DisplayChangeDebounce, Timeout.InfiniteTimeSpan);
         }
         catch (ObjectDisposedException)
         {
@@ -448,8 +458,17 @@ public sealed class RotationService : IDisposable
         _disposed = true;
         _heartbeat?.Dispose();
         _heartbeat = null;
-        _displayTimer?.Dispose();
-        _displayTimer = null;
+
+        // Detach the display timer under _sync — the same lock OnDisplayChanged reads it under (WR-03) — and dispose
+        // it outside, so a debounce callback that is taking _sync right now cannot wait on the dispose.
+        ITimer? displayTimer;
+        lock (_sync)
+        {
+            displayTimer = _displayTimer;
+            _displayTimer = null;
+        }
+
+        displayTimer?.Dispose();
     }
 
     // ---- heartbeat ------------------------------------------------------------------------------------
