@@ -1,9 +1,11 @@
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.Marshalling;
 using System.Runtime.Versioning;
 using BingWallpaperUpdater.Core.Diagnostics;
 using BingWallpaperUpdater.Core.Ports;
 using Windows.Win32;
 using Windows.Win32.Foundation;
+using Windows.Win32.System.Com;
 using Windows.Win32.UI.Shell;
 
 namespace BingWallpaperUpdater.Windows.Wallpaper;
@@ -12,8 +14,9 @@ namespace BingWallpaperUpdater.Windows.Wallpaper;
 /// Applies a wallpaper through <c>IDesktopWallpaper</c> (Windows 8+): <c>SetPosition(DWPOS_FILL)</c> first,
 /// then <c>SetWallpaper(NULL, path)</c> — a NULL monitor ID means every monitor (WALL-02). The result is read
 /// back with <c>GetWallpaper(NULL)</c>/<c>GetPosition</c> and a mismatch is logged, never thrown (PITFALLS P4).
-/// Call on the WinForms UI thread; the COM proxy is created per apply and simply dropped afterwards
-/// (source-generated <c>ComObject</c> RCWs must not go through the Marshal release helpers).
+/// Call on the WinForms UI thread; one COM proxy is created per operation and released deterministically in a
+/// <c>finally</c> on the same STA thread (<see cref="Activate"/> / <see cref="Release"/>, WR-02) — never left to the
+/// MTA finalizer thread, and never through <c>Marshal.ReleaseComObject</c>, which rejects source-generated RCWs.
 /// When activation itself throws (any type <see cref="ComFailure.IsActivationFailure"/> admits), the call degrades
 /// to <see cref="SpiWallpaperFallback"/>; a failure after a successful activation (bad path, shell error — any type
 /// <see cref="ComFailure.IsCallFailure"/> admits) is reported as an <see cref="ApplyResult"/> without falling back.
@@ -24,9 +27,12 @@ namespace BingWallpaperUpdater.Windows.Wallpaper;
 /// because <c>GetWallpaper(NULL)</c> is empty whenever monitors differ (03-RESEARCH Pitfall 8).
 /// </summary>
 [SupportedOSPlatform("windows8.0")]
-public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
+public sealed unsafe partial class DesktopWallpaperApplier : IWallpaperApplier
 {
     private const string MethodName = "com";
+
+    // CLSID_DesktopWallpaper {C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}; the CsWin32 DesktopWallpaper class keeps its copy private.
+    private static readonly Guid ClsidDesktopWallpaper = new(0xC2CF3110, 0x460E, 0x4FC1, 0xB9, 0xD0, 0x8A, 0x1C, 0x0C, 0x9C, 0xC4, 0xBD);
 
     public ApplyResult Apply(string absolutePath)
     {
@@ -38,12 +44,12 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
         IDesktopWallpaper wallpaper;
         try
         {
-            wallpaper = DesktopWallpaper.CreateInstance<IDesktopWallpaper>();
+            wallpaper = Activate();
         }
         catch (Exception ex) when (ComFailure.IsActivationFailure(ex))
         {
             // Activation failure only (no IDesktopWallpaper on this session): degrade to the legacy SPI path.
-            // CreateInstance goes through Marshal.ThrowExceptionForHR, which maps HRESULTs to several types
+            // Activate goes through Marshal.ThrowExceptionForHR, which maps HRESULTs to several types
             // (COMException, InvalidCastException, NotImplementedException, UnauthorizedAccessException, ...).
             Log.Warn($"apply failed method={MethodName} error=activation failed {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
             return SpiWallpaperFallback.Apply(absolutePath);
@@ -74,6 +80,10 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
             // ArgumentException and E_ACCESSDENIED as UnauthorizedAccessException, not only as COMException.
             return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
         }
+        finally
+        {
+            Release(wallpaper);
+        }
     }
 
     /// <inheritdoc />
@@ -82,7 +92,7 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
         IDesktopWallpaper wallpaper;
         try
         {
-            wallpaper = DesktopWallpaper.CreateInstance<IDesktopWallpaper>();
+            wallpaper = Activate();
         }
         catch (Exception ex) when (ComFailure.IsActivationFailure(ex))
         {
@@ -125,6 +135,10 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
             Log.Warn($"monitors unavailable error={ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
             return [];
         }
+        finally
+        {
+            Release(wallpaper);
+        }
 
         Log.Info($"monitors attached={attached.Count} total={count}");
         return attached;
@@ -150,7 +164,7 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
         IDesktopWallpaper wallpaper;
         try
         {
-            wallpaper = DesktopWallpaper.CreateInstance<IDesktopWallpaper>();
+            wallpaper = Activate();
         }
         catch (Exception ex) when (ComFailure.IsActivationFailure(ex))
         {
@@ -200,10 +214,62 @@ public sealed unsafe class DesktopWallpaperApplier : IWallpaperApplier
         {
             return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
         }
+        finally
+        {
+            Release(wallpaper);
+        }
     }
 
     private static bool IsUsablePath(string? absolutePath) =>
         !string.IsNullOrEmpty(absolutePath) && Path.IsPathRooted(absolutePath) && File.Exists(absolutePath);
+
+    /// <summary>
+    /// One <c>IDesktopWallpaper</c> proxy for one operation (WR-02). The CsWin32 <c>DesktopWallpaper.CreateInstance</c>
+    /// helper marshals through <see cref="ComInterfaceMarshaller{T}"/>, i.e. the shared ComWrappers cache, whose RCW
+    /// drops its COM reference only from the finalizer thread — so proxies piled up between ticks under the
+    /// non-concurrent GC. Activating through the raw <c>CoCreateInstance</c> and
+    /// <see cref="UniqueComInterfaceMarshaller{T}"/> yields a unique-instance <see cref="ComObject"/>, the only kind
+    /// <see cref="ComObject.FinalRelease"/> acts on, so <see cref="Release"/> can drop the reference deterministically
+    /// on the calling STA thread. Throws the same types the CsWin32 helper threw (<c>Marshal.ThrowExceptionForHR</c>
+    /// mapping; <see cref="InvalidCastException"/> when the interface is not implemented), so the callers'
+    /// <see cref="ComFailure.IsActivationFailure"/> filters are unchanged.
+    /// </summary>
+    private static IDesktopWallpaper Activate()
+    {
+        Guid clsid = ClsidDesktopWallpaper;
+        Guid iid = typeof(IDesktopWallpaper).GUID;
+        void* raw = null;
+        CoCreateInstance(&clsid, null, CLSCTX.CLSCTX_SERVER, &iid, &raw).ThrowOnFailure();
+        if (raw is null)
+        {
+            throw new InvalidCastException("CoCreateInstance(CLSID_DesktopWallpaper) succeeded without an IDesktopWallpaper pointer");
+        }
+
+        try
+        {
+            // The wrapper takes its own reference; the one CoCreateInstance handed us is released below.
+            return UniqueComInterfaceMarshaller<IDesktopWallpaper>.ConvertToManaged(raw)
+                ?? throw new InvalidCastException("CoCreateInstance(CLSID_DesktopWallpaper) produced no IDesktopWallpaper wrapper");
+        }
+        finally
+        {
+            Marshal.Release((nint)raw);
+        }
+    }
+
+    /// <summary>Releases the proxy <see cref="Activate"/> produced; it must not be used afterwards. Same STA thread as the create.</summary>
+    private static void Release(IDesktopWallpaper wallpaper)
+    {
+        // The runtime type is the (sealed) ComObject reached through IDynamicInterfaceCastable, hence the object hop.
+        if ((object)wallpaper is ComObject proxy)
+        {
+            proxy.FinalRelease();
+        }
+    }
+
+    [LibraryImport("ole32.dll", EntryPoint = "CoCreateInstance")]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static partial HRESULT CoCreateInstance(Guid* rclsid, void* pUnkOuter, CLSCTX dwClsContext, Guid* riid, void** ppv);
 
     /// <summary>The device path at <paramref name="index"/>; the shell's CoTaskMem string is freed once copied.</summary>
     private static string? DevicePathAt(IDesktopWallpaper wallpaper, uint index)
