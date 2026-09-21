@@ -62,32 +62,51 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add("Exit", null, (_, _) => Shutdown("exit"));
         menu.Opening += (_, _) => next.Enabled = !_rotation.IsTickRunning;   // D-05: disabled while a tick runs
 
+        // Shown only once everything below has succeeded (IN-02): a constructor that throws after the icon is
+        // visible leaves it in the tray until hovered (dotnet/winforms #6996) and nothing would ever dispose it.
         _icon = new NotifyIcon
         {
             Icon = LoadTrayIcon(),
             Text = "Bing Wallpaper Updater",
             ContextMenuStrip = menu,
-            Visible = true,
+            Visible = false,
         };
-
-        _sessionEnding = (_, _) => Shutdown("session-ending");
-        SystemEvents.SessionEnding += _sessionEnding;
 
         SynchronizationContext ui = SynchronizationContext.Current
             ?? throw new InvalidOperationException("no WinForms synchronization context on the UI thread");
 
         _http = new HttpGateway();
-        Settings settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
-        AppState state = AppState.LoadOrCreate(AppPaths.StatePath);
-        var cache = new ImageCache(AppPaths.CacheDir, AppPaths.IndexPath);
-        cache.Reconcile();   // CACHE-05: once per launch, before the first tick
-        var catalog = new CatalogService(_http, state, AppPaths.CatalogBodyPath);
-        IWallpaperApplier applier = new DesktopWallpaperApplier();
-        var dispatcher = new WinFormsUiDispatcher(ui);
-        _rotation = new RotationService(settings, state, AppPaths.StatePath, catalog, cache, _http, applier, dispatcher);
+        Settings settings;
+        RotationService? rotation = null;
+        PowerWindow? powerWindow = null;
+        try
+        {
+            settings = Settings.LoadOrCreate(AppPaths.SettingsPath);
+            AppState state = AppState.LoadOrCreate(AppPaths.StatePath);
+            var cache = new ImageCache(AppPaths.CacheDir, AppPaths.IndexPath);
+            cache.Reconcile();   // CACHE-05: once per launch, before the first tick
+            var catalog = new CatalogService(_http, state, AppPaths.CatalogBodyPath);
+            IWallpaperApplier applier = new DesktopWallpaperApplier();
+            var dispatcher = new WinFormsUiDispatcher(ui);
+            rotation = new RotationService(settings, state, AppPaths.StatePath, catalog, cache, _http, applier, dispatcher);
 
-        // D-10 resume fast path: the hidden window only re-arms the heartbeat (8 s debounce); the heartbeat runs the check.
-        _powerWindow = new PowerWindow();
+            // D-10 resume fast path: the hidden window only re-arms the heartbeat (8 s debounce); the heartbeat runs the check.
+            powerWindow = new PowerWindow();
+        }
+        catch
+        {
+            // Nothing is visible or subscribed yet; release what was created so a failed launch leaves no tray
+            // icon, no power window and no open socket behind, then let the exception reach Main.
+            powerWindow?.Dispose();
+            rotation?.Dispose();
+            _http.Dispose();
+            _icon.Dispose();
+            _cts.Dispose();
+            throw;
+        }
+
+        _rotation = rotation;
+        _powerWindow = powerWindow;
         _powerWindow.Resumed += source => _rotation.Nudge(source);
 
         // Secondary bridges (RESEARCH Pattern 6). Each handler lives in a field so Dispose can unsubscribe it; each
@@ -100,6 +119,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
         SystemEvents.PowerModeChanged += _powerModeChanged;
         NetworkChange.NetworkAvailabilityChanged += _networkChanged;
         SystemEvents.DisplaySettingsChanged += _displayChanged;
+
+        // Last: everything Shutdown disposes now exists, so the icon may appear and session end may route to it.
+        _sessionEnding = (_, _) => Shutdown("session-ending");
+        SystemEvents.SessionEnding += _sessionEnding;
+        _icon.Visible = true;
 
         TimeSpan initialDelay = startup ? TimeSpan.FromSeconds(Random.Shared.Next(30, 61)) : TimeSpan.Zero;
         Log.Info($"schedule start launch={(startup ? "autostart" : "manual")} firstTickIn={(int)initialDelay.TotalSeconds}s interval={settings.IntervalMinutes} mode={settings.Mode}");
