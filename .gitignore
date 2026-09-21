@@ -7,3 +7,8 @@ build.log
 # IDE / user state
 *.user
 .vs/
+
+# GSD session-local files
+.gsd/
+.planning/milestone.lock
+.planning/research/.cache/
