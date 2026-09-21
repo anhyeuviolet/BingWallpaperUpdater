@@ -142,6 +142,25 @@ public sealed class ImageCacheReconcileTests : IDisposable
         Assert.Equal(2, result.Index.Images.Count);
     }
 
+    /// <summary>
+    /// <see cref="CacheIndex.NextSeq"/> is a monotonic counter that must survive the rebuild unchanged, and no
+    /// surviving entry is ever renumbered. The rebuilt index used to start from the default 1 again.
+    /// </summary>
+    [Fact]
+    public void Reconcile_CarriesNextSeqFromTheLoadedIndex()
+    {
+        CacheIndex index = ThreeEntries();
+        index.NextSeq = 7;
+        index.Images[0].Seq = 1;
+        index.Images[1].Seq = 2;
+        index.Images[2].Seq = 3;
+
+        ReconcileResult result = CacheReconciler.Reconcile(index, ["2026-09-01_Image1.jpg", "2026-09-01_Image2.jpg", "2026-09-01_Image3.jpg"]);
+
+        Assert.Equal(7, result.Index.NextSeq);
+        Assert.Equal([1L, 2L, 3L], result.Index.Images.Select(i => i.Seq));
+    }
+
     // ---- loading a hand-edited index -----------------------------------------------------------------
 
     [Fact]
@@ -253,5 +272,55 @@ public sealed class ImageCacheReconcileTests : IDisposable
         Assert.Null(ex);
         Assert.Empty(cache.Index.Images);
         Assert.Contains("reconcile dropped=0 parts=0", LogText());
+    }
+
+    /// <summary>
+    /// Observed live 2026-09-21: after an app restart <c>index.json</c> held two images both at <c>seq: 1</c> with
+    /// <c>nextSeq: 2</c>. <see cref="ImageCache.Reconcile"/> replaced the loaded (and clamped) index with the
+    /// reconciler's rebuilt one, which started <see cref="CacheIndex.NextSeq"/> from the default 1 again, so the
+    /// next <see cref="ImageCache.Add"/> re-issued a Seq an existing entry already held. A duplicate Seq makes
+    /// <c>RotationDecider.IsNoNewerThan</c> (<c>a.Seq &lt;= b.Seq</c>) read two different images as "no newer",
+    /// so the newest image is never applied (WR-01 v2 ordering, D-07). Row 3 models an index written with NextSeq
+    /// persisted; row 1 models an older index written before NextSeq existed (the clamp must still lift it).
+    /// </summary>
+    [Theory]
+    [InlineData(3)]
+    [InlineData(1)]
+    public void ImageCacheReconcile_ThenAdd_HandsOutSeqAboveEveryExistingSeq(long nextSeqOnDisk)
+    {
+        string indexPath = Path.Combine(_dir, "index.json");
+        CachedImage first = Image(1);
+        first.Seq = 1;
+        CachedImage second = Image(2);
+        second.Seq = 2;
+        var index = new CacheIndex
+        {
+            Applied = ["OHR.Image1_EN-US1"],
+            Images = [first, second],
+            NextSeq = nextSeqOnDisk,
+        };
+        AtomicJsonFile.Save(indexPath, index, CoreJsonContext.Default.CacheIndex);
+        File.WriteAllBytes(Path.Combine(_dir, first.File), new byte[16]);
+        File.WriteAllBytes(Path.Combine(_dir, second.File), new byte[16]);
+
+        var cache = new ImageCache(_dir, indexPath);
+        cache.Reconcile();
+
+        Assert.Equal(3, cache.Index.NextSeq);
+
+        CachedImage incoming = Image(3);
+        File.WriteAllBytes(Path.Combine(_dir, incoming.File), new byte[16]);
+        CachedImage third = cache.Add(incoming);
+
+        Assert.Equal(3, third.Seq);
+        Assert.Equal(4, cache.Index.NextSeq);
+        long[] seqs = [.. cache.Index.Images.Select(i => i.Seq)];
+        Assert.Equal([1L, 2L, 3L], seqs);
+        Assert.Equal(seqs.Length, seqs.Distinct().Count());
+
+        CacheIndex? onDisk = AtomicJsonFile.Load(indexPath, CoreJsonContext.Default.CacheIndex);
+        Assert.NotNull(onDisk);
+        Assert.Equal(4, onDisk!.NextSeq);
+        Assert.Equal(3, Assert.Single(onDisk.Images, i => i.Id == "OHR.Image3_EN-US3").Seq);
     }
 }
