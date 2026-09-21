@@ -44,6 +44,7 @@ public sealed class RotationService : IDisposable
     private DateTimeOffset? _retryDueUtc;   // in-memory backoff due time; null when no retry is pending
     private int _failureStage;               // 0 after any successful fetch; +1 per failed fetch
     private int _appliedIntervalMinutes;     // the interval the current NextDueUtc was computed with (ApplySettings, D-07)
+    private LastErrorKind _lastError;        // what the last tick left for the window's last-error line (UI-04); guarded by _sync
     private bool _startupTickDone;
     private volatile bool _disposed;
     private CancellationToken _ct;
@@ -88,8 +89,33 @@ public sealed class RotationService : IDisposable
         _appliedIntervalMinutes = settings.IntervalMinutes;
     }
 
+    /// <summary>
+    /// Any thread — raised after every tick once the gate is released (so a subscriber's <see cref="Snapshot"/> reads
+    /// <c>TickRunning == false</c>) and at the end of <see cref="ApplySettings"/>; never at gate acquisition. The
+    /// Settings window subscribes while open and marshals to its own thread (UI-04). A throwing handler is logged
+    /// and can never break the tick.
+    /// </summary>
+    public event Action? StateChanged;
+
     /// <summary>True while a tick holds the gate; the tray reads it to disable "Next wallpaper" (D-05).</summary>
     public bool IsTickRunning => _gate.CurrentCount == 0;
+
+    /// <summary>
+    /// The read-only view for the Settings window (UI-04): schedule fields and the last-error kind under <c>_sync</c>,
+    /// the current image's metadata looked up by <see cref="AppState.CurrentImageId"/> in the cache index (a benign
+    /// reference read of a list <c>Add</c> replaces wholesale — never written from here).
+    /// </summary>
+    public RotationSnapshot Snapshot()
+    {
+        lock (_sync)
+        {
+            string? id = _state.CurrentImageId;
+            CachedImage? current = id is null
+                ? null
+                : _cache.Index.Images.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.Ordinal));
+            return new RotationSnapshot(current?.Title, current?.Copyright, current?.Date, _state.LastCheckUtc, _state.NextDueUtc, IsTickRunning, _lastError);
+        }
+    }
 
     /// <summary>Mirrors <see cref="AppState.NextDueUtc"/> (read under the lock its writers hold, WR-03).</summary>
     public DateTimeOffset? NextDueUtc => ReadNextDue();
@@ -177,6 +203,20 @@ public sealed class RotationService : IDisposable
         finally
         {
             _gate.Release();
+            RaiseStateChanged();   // after the release: a subscriber's Snapshot() must read TickRunning == false
+        }
+    }
+
+    /// <summary>Invokes <see cref="StateChanged"/> on the calling thread; a subscriber that throws is logged, never propagated (T-03-04).</summary>
+    private void RaiseStateChanged()
+    {
+        try
+        {
+            StateChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("state changed handler failed", ex);
         }
     }
 
@@ -258,6 +298,7 @@ public sealed class RotationService : IDisposable
         TrySaveState();
         Log.Info($"settings applied interval={_appliedIntervalMinutes} mode={_settings.Mode} resolution={_settings.Resolution} market={_settings.Market} monitors={_settings.MonitorMode} language={_settings.Language} next={ReadNextDue()?.ToString("O") ?? "-"}");
         Nudge("settings");
+        RaiseStateChanged();
     }
 
     /// <summary>
@@ -378,6 +419,7 @@ public sealed class RotationService : IDisposable
         string? path = null;
         ImageId id = default;
         RotationDecision? decision = null;
+        ApplyResult? apply = null;   // kept for the last-error classification (UI-04): read-back mismatch is not a failure
         TickResult result = TickResult.NoOp;
 
         try
@@ -437,7 +479,7 @@ public sealed class RotationService : IDisposable
             {
                 string applyPath = path;
                 ImageId applyId = id;
-                ApplyResult apply = await _ui.InvokeAsync(
+                apply = await _ui.InvokeAsync(
                     () => ApplyStage.Run(_applier, applyPath, applyId, _cache, _state, _statePath, now), ct).ConfigureAwait(false);
                 if (apply.Ok && decision.Kind == DecisionKind.ApplyNew)
                 {
@@ -504,6 +546,13 @@ public sealed class RotationService : IDisposable
                 _failureStage = 0;
                 _retryDueUtc = null;
             }
+
+            // The window's last-error line (UI-04, locked ROADMAP note): Apply beats Fetch beats ReadBack; a clean tick
+            // clears it. A read-back mismatch is Ok for the pipeline (ApplyStage policy) but shown to the user.
+            _lastError = threw || result == TickResult.ApplyFailed ? LastErrorKind.Apply
+                : fetchFailed ? LastErrorKind.Fetch
+                : apply is { Ok: true, ReadBackPath: { } readBack } && path is not null && !string.Equals(readBack, path, StringComparison.OrdinalIgnoreCase) ? LastErrorKind.ReadBack
+                : LastErrorKind.None;
 
             retryDue = _retryDueUtc;
             nextDue = _state.NextDueUtc;

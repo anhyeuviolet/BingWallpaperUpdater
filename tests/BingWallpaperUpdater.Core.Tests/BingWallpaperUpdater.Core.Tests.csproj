@@ -23,6 +23,8 @@
 
   <ItemGroup>
     <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The App's resx pair, linked so ResxParityTests can read them without a reference to the Windows-only App project. -->
+    <None Include="..\..\src\BingWallpaperUpdater.App\Resources\Strings*.resx" Link="Resx\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

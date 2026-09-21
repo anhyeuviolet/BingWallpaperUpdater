@@ -201,10 +201,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         _settingsForm = new SettingsForm(_settings, _rotation, this, _cts.Token);
-        _settingsForm.FormClosed += (_, _) =>
+        _settingsForm.FormClosed += (_, e) =>
         {
             _settingsForm = null;
-            Log.Info("settings window action=close");
+            Log.Info($"settings window action=close reason={e.CloseReason}");
         };
         _settingsForm.Show();
         Log.Info("settings window action=open");

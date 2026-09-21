@@ -1511,4 +1511,139 @@ public sealed class RotationServiceTests : IDisposable
 
         dispatcher.Release();   // nothing is left parked
     }
+
+    // ---- Phase 3: Snapshot() and StateChanged for the Settings window (UI-04) -------------------------
+
+    [Fact]
+    public void Snapshot_NoCurrentImage_ReturnsBlankMetadataAndNullTimes()
+    {
+        Harness h = Build(Newest(), new AppState());
+
+        RotationSnapshot s = h.Service.Snapshot();
+
+        Assert.Null(s.Title);
+        Assert.Null(s.Copyright);
+        Assert.Null(s.Date);
+        Assert.Null(s.LastCheckUtc);
+        Assert.Null(s.NextDueUtc);
+        Assert.False(s.TickRunning);
+        Assert.Equal(LastErrorKind.None, s.LastError);
+    }
+
+    [Fact]
+    public async Task Snapshot_AfterApply_ReturnsCachedTitleCopyrightDateAndTimes()
+    {
+        Harness h = Build(Newest(), new AppState());
+
+        await StartAsync(h);
+        RotationSnapshot s = h.Service.Snapshot();
+
+        CachedImage cached = Assert.Single(h.Cache.Index.Images, i => i.Id == NewestId);
+        Assert.Equal("The Alpine sound of Oktoberfest", cached.Title);   // enriched from the HPImageArchive fixture
+        Assert.Equal(cached.Title, s.Title);
+        Assert.Equal(cached.Copyright, s.Copyright);
+        Assert.Equal(cached.Date, s.Date);
+        Assert.Equal(T0, s.LastCheckUtc);
+        Assert.Equal(T0 + Interval, s.NextDueUtc);
+        Assert.False(s.TickRunning);
+        Assert.Equal(LastErrorKind.None, s.LastError);
+    }
+
+    [Fact]
+    public async Task Snapshot_AfterOfflineTick_LastErrorIsFetch_AndClearsAfterSuccess()
+    {
+        var network = new Network { Online = false };
+        ImageCache cache = SeedCache([Cached(OldestId, "2026-09-14")], applied: OldestId);
+        Harness h = Build(Newest(), SeenState(current: OldestId), cache, Switchable(network));
+
+        await StartAsync(h);
+        Assert.Equal(LastErrorKind.Fetch, h.Service.Snapshot().LastError);
+        Assert.Equal(T0, h.Service.Snapshot().LastCheckUtc);   // Last checked advances even when the fetch fails
+
+        network.Online = true;
+        await AdvanceAsync(h, TimeSpan.FromMinutes(5));   // the first retry succeeds
+
+        Assert.Equal(LastErrorKind.None, h.Service.Snapshot().LastError);
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+    }
+
+    [Fact]
+    public async Task Snapshot_AfterFailedApply_LastErrorIsApply()
+    {
+        var applier = new FakeApplier { FailNext = true };
+        Harness h = Build(Newest(), new AppState(), applier: applier);
+
+        await StartAsync(h);
+
+        Assert.Equal(1, applier.Calls);
+        Assert.Equal(LastErrorKind.Apply, h.Service.Snapshot().LastError);
+        Assert.Contains("tick done reason=Startup result=ApplyFailed", LogText());
+    }
+
+    [Fact]
+    public async Task Snapshot_AfterThrowingApply_LastErrorIsApply()
+    {
+        var applier = new FakeApplier { ThrowNext = new InvalidOperationException("boom") };
+        Harness h = Build(Newest(), new AppState(), applier: applier);
+
+        await StartAsync(h);
+
+        Assert.Equal(LastErrorKind.Apply, h.Service.Snapshot().LastError);
+        Assert.Contains("tick done reason=Startup result=Failed", LogText());
+    }
+
+    [Fact]
+    public async Task Snapshot_AfterReadBackMismatch_LastErrorIsReadBack()
+    {
+        var applier = new FakeApplier { ReadBackOverride = Path.Combine(_dir, "spotlight.jpg") };
+        Harness h = Build(Newest(), new AppState(), applier: applier);
+
+        await StartAsync(h);
+
+        Assert.Equal(NewestId, h.State.CurrentImageId);   // the apply is still Ok for the pipeline (ApplyStage policy)
+        Assert.Equal(LastErrorKind.ReadBack, h.Service.Snapshot().LastError);
+
+        applier.ReadBackOverride = null;
+        await AdvanceAsync(h, Interval);   // the next interval tick reads back its own path again
+
+        Assert.Equal(LastErrorKind.None, h.Service.Snapshot().LastError);
+    }
+
+    [Fact]
+    public async Task StateChanged_RaisedAfterTickAndAfterApplySettings_WithTickRunningFalse()
+    {
+        Harness h = Build(Newest(), new AppState());
+        int raised = 0;
+        int runningWhenRaised = 0;
+        h.Service.StateChanged += () =>
+        {
+            Interlocked.Increment(ref raised);
+            if (h.Service.Snapshot().TickRunning)
+            {
+                Interlocked.Increment(ref runningWhenRaised);
+            }
+        };
+
+        await StartAsync(h);
+        Assert.Equal(1, raised);
+
+        h.Service.ApplySettings();
+        Assert.Equal(2, raised);
+        Assert.Equal(0, runningWhenRaised);   // raised only after the gate is released, never at acquisition
+    }
+
+    [Fact]
+    public async Task StateChanged_HandlerThrows_TickStillCompletes()
+    {
+        Harness h = Build(Newest(), new AppState());
+        h.Service.StateChanged += () => throw new InvalidOperationException("ui handler bug");
+
+        TickResult result = await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+
+        Assert.Equal(TickResult.Applied, result);
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.False(h.Service.IsTickRunning);
+        Assert.Contains("state changed handler failed", LogText());
+        Assert.Contains("ui handler bug", LogText());
+    }
 }

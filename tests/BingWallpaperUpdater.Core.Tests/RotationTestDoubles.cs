@@ -62,6 +62,13 @@ internal sealed class FakeApplier : IWallpaperApplier
     /// <summary>One-shot: the next <see cref="Apply"/> still counts the call and records the path, then throws this and clears it.</summary>
     public Exception? ThrowNext { get; set; }
 
+    /// <summary>
+    /// When non-null, every successful <see cref="Apply"/> reports this as <see cref="ApplyResult.ReadBackPath"/> instead
+    /// of the applied path — the shell "showing something else" (Windows Spotlight / settings sync) that the Settings
+    /// window surfaces as <c>LastErrorKind.ReadBack</c>. Sticky until <see cref="Reset"/> or set back to null.
+    /// </summary>
+    public string? ReadBackOverride { get; set; }
+
     /// <summary>Back to a clean applier: counters, paths and any still-armed one-shot failure (IN-10).</summary>
     public void Reset()
     {
@@ -70,6 +77,7 @@ internal sealed class FakeApplier : IWallpaperApplier
         Paths.Clear();
         FailNext = false;
         ThrowNext = null;
+        ReadBackOverride = null;
     }
 
     public ApplyResult Apply(string absolutePath)
@@ -89,6 +97,6 @@ internal sealed class FakeApplier : IWallpaperApplier
             return new ApplyResult(false, "fake", null, null, "forced failure");
         }
 
-        return new ApplyResult(true, "fake", absolutePath, "DWPOS_FILL", null);
+        return new ApplyResult(true, "fake", ReadBackOverride ?? absolutePath, "DWPOS_FILL", null);
     }
 }
