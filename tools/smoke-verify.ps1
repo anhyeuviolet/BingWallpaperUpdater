@@ -172,7 +172,9 @@ function Write-State([hashtable]$Fields) {
         $value = [string]$Fields[$name]
         if ($value -match '["\\]') { Fail "Write-State value for $name contains a quote or backslash: $value" }
         $pattern = '"' + [regex]::Escape($name) + '"\s*:\s*(?:"[^"]*"|null)'
-        $replacement = '"' + $name + '": "' + $value + '"'
+        # -replace treats '$' in the replacement as a group reference ($1, ${name}, $&, ...); escape it as '$$' so the
+        # value is written literally whatever it contains (IN-06). Inert for ISO dates and OHR. IDs, but not relied on.
+        $replacement = ('"' + $name + '": "' + $value + '"').Replace('$', '$$')
         if ($text -match $pattern) {
             $text = $text -replace $pattern, $replacement
         } else {
