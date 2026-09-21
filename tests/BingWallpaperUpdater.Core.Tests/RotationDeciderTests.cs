@@ -18,7 +18,7 @@ public sealed class RotationDeciderTests
     private static readonly DateTimeOffset T0 = new(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly Random Seeded = new(20260920);
 
-    private static CachedImage Cached(string id, string? date, int downloadedMinutesAfterT0 = 0, string resolution = "UHD", int width = 3840) => new()
+    private static CachedImage Cached(string id, string? date, int downloadedMinutesAfterT0 = 0, string resolution = "UHD", int width = 3840, long seq = 0) => new()
     {
         Id = id,
         Market = "EN-US",
@@ -29,6 +29,7 @@ public sealed class RotationDeciderTests
         File = $"{date ?? "nodate"}_{id}_{resolution}.jpg",
         Bytes = 16,
         DownloadedUtc = T0.AddMinutes(downloadedMinutesAfterT0),
+        Seq = seq,
     };
 
     private static CatalogEntry Entry(string id)
@@ -121,6 +122,56 @@ public sealed class RotationDeciderTests
         Assert.Equal(DecisionKind.ApplyNew, d.Kind);
         Assert.Equal(NewestId, d.Entry!.Id.Value);
         Assert.Equal("new", d.Why);
+    }
+
+    [Fact]
+    public void CachedNewest_AddedAfterLastSeen_BackwardClockStamp_StillApplyNew()
+    {
+        // WR-01 (iteration 2): the clock was set back 3 h between the two downloads, so the genuinely newer image
+        // carries the earlier wall-clock stamp. Seq is what orders the cache, so it must still be applied.
+        IReadOnlyList<CachedImage> candidates =
+        [
+            Cached(FreshId, "2026-09-21", downloadedMinutesAfterT0: -180, seq: 2),
+            Cached(NewestId, "2026-09-20", downloadedMinutesAfterT0: 0, seq: 1),
+        ];
+
+        RotationDecision d = Decide(TickReason.Interval, false, Entry(FreshId), Current(NewestId, NewestId), candidates);
+
+        Assert.Equal(DecisionKind.ApplyNew, d.Kind);
+        Assert.Equal(FreshId, d.Entry!.Id.Value);
+        Assert.Equal("new", d.Why);
+    }
+
+    [Fact]
+    public void CachedOlderNewest_AddedBeforeLastSeen_BackwardClockStamp_NotNew()
+    {
+        // The mirror image: the older ID carries the later wall-clock stamp (it was downloaded after the clock was
+        // set back), yet its Seq says it entered the cache first, so a source switch must not re-apply it.
+        IReadOnlyList<CachedImage> candidates =
+        [
+            Cached(FreshId, "2026-09-21", downloadedMinutesAfterT0: -180, seq: 2),
+            Cached(NewestId, "2026-09-20", downloadedMinutesAfterT0: 0, seq: 1),
+        ];
+
+        RotationDecision d = Decide(TickReason.Interval, false, Entry(NewestId), Current(FreshId, FreshId), candidates);
+
+        Assert.Equal(DecisionKind.NoOp, d.Kind);
+        Assert.Equal("unchanged", d.Why);
+    }
+
+    [Fact]
+    public void AlreadyKnown_PreSeqEntries_FallBackToDownloadedUtc()
+    {
+        // Entries written by earlier builds carry Seq = 0; the comparison falls back to DownloadedUtc for them
+        // (the mixed case too, since a single Seq cannot be ordered against "unknown").
+        IReadOnlyList<CachedImage> candidates =
+        [
+            Cached(FreshId, "2026-09-21", downloadedMinutesAfterT0: 10, seq: 0),
+            Cached(NewestId, "2026-09-20", downloadedMinutesAfterT0: 0, seq: 7),
+        ];
+
+        Assert.Equal(DecisionKind.ApplyNew, Decide(TickReason.Interval, false, Entry(FreshId), Current(NewestId, NewestId), candidates).Kind);
+        Assert.Equal(DecisionKind.NoOp, Decide(TickReason.Interval, false, Entry(NewestId), Current(FreshId, FreshId), candidates).Kind);
     }
 
     [Fact]

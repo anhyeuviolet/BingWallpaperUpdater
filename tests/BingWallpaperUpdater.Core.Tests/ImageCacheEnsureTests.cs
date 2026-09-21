@@ -217,6 +217,56 @@ public sealed class ImageCacheEnsureTests : IDisposable
     }
 
     [Fact]
+    public async Task Ensure_Miss_StampsDownloadedUtcFromInjectedClock_AndAssignsMonotonicSeq_Persisted()
+    {
+        // WR-01 (iteration 2): DownloadedUtc comes from the injected TimeProvider (not DateTimeOffset.UtcNow), and
+        // Seq is handed out from CacheIndex.NextSeq in add order — even when the clock runs backwards in between —
+        // and both survive a save/load round trip.
+        var fake = new FakeHttpHandler(_ => FakeHttpHandler.Bytes(200, "image/jpeg", JpegBytes.Sof0(3840, 2160)));
+        using HttpGateway http = ScriptedGateway(fake);
+        var clock = new Microsoft.Extensions.Time.Testing.FakeTimeProvider(new DateTimeOffset(2026, 9, 20, 10, 0, 0, TimeSpan.Zero));
+        var cache = new ImageCache(_dir, _indexPath, clock);
+        cache.Load();
+        Assert.Equal(1, cache.Index.NextSeq);
+
+        CachedImage? first = await cache.EnsureAsync(Entry(), "UHD", http, CancellationToken.None);
+        clock.AdjustTime(clock.GetUtcNow() - TimeSpan.FromHours(3));
+        CachedImage? second = await cache.EnsureAsync(Entry("OHR.ParisSunset_EN-US6532307523"), "UHD", http, CancellationToken.None);
+
+        Assert.NotNull(first);
+        Assert.NotNull(second);
+        Assert.Equal(new DateTimeOffset(2026, 9, 20, 10, 0, 0, TimeSpan.Zero), first!.DownloadedUtc);
+        Assert.Equal(new DateTimeOffset(2026, 9, 20, 7, 0, 0, TimeSpan.Zero), second!.DownloadedUtc);
+        Assert.Equal(1, first.Seq);
+        Assert.Equal(2, second.Seq);
+        Assert.Equal(3, cache.Index.NextSeq);
+
+        var reloaded = new ImageCache(_dir, _indexPath, clock);
+        reloaded.Load();
+        Assert.Equal(3, reloaded.Index.NextSeq);
+        Assert.Equal(1, reloaded.Index.Images.Single(i => i.Id == Id).Seq);
+        Assert.Equal(2, reloaded.Index.Images.Single(i => i.Id == "OHR.ParisSunset_EN-US6532307523").Seq);
+    }
+
+    [Fact]
+    public void Load_IndexWithoutNextSeq_StartsAboveEveryExistingSeq()
+    {
+        // An older index carries no NextSeq (defaults to 1) but may have been hand-edited; NextSeq must never
+        // re-issue a value an entry already holds.
+        var index = new CacheIndex
+        {
+            Images = [Cached(Id, "UHD", "2026-09-20_AlphornBavaria.jpg")],
+        };
+        index.Images[0].Seq = 5;
+        AtomicJsonFile.Save(_indexPath, index, CoreJsonContext.Default.CacheIndex);
+
+        var cache = new ImageCache(_dir, _indexPath);
+        cache.Load();
+
+        Assert.Equal(6, cache.Index.NextSeq);
+    }
+
+    [Fact]
     public async Task ThrowingHandler_ThrowsOnAnyUse()
     {
         using var client = new HttpClient(new ThrowingHandler());

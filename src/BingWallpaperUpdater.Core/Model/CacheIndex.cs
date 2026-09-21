@@ -8,6 +8,12 @@ public sealed class CacheIndex
 {
     public int SchemaVersion { get; set; } = 1;
 
+    /// <summary>
+    /// The next <see cref="CachedImage.Seq"/> handed out by <c>ImageCache.Add</c>; 1-based so that 0 always means
+    /// "written before this field existed". Never decreases, so cache order survives any wall-clock change.
+    /// </summary>
+    public long NextSeq { get; set; } = 1;
+
     /// <summary>Image IDs currently set as wallpaper (exactly one entry in Phase 1).</summary>
     public List<string> Applied { get; set; } = [];
 
@@ -37,4 +43,11 @@ public sealed class CachedImage
     public long Bytes { get; set; }
     public string SourceUrl { get; set; } = string.Empty;
     public DateTimeOffset DownloadedUtc { get; set; }
+
+    /// <summary>
+    /// Monotonic position in the cache, assigned from <see cref="CacheIndex.NextSeq"/> when the entry is added;
+    /// 0 for entries written by earlier builds. Unlike <see cref="DownloadedUtc"/> it is immune to clock changes,
+    /// so "added later" can be decided without trusting the wall clock (WR-01).
+    /// </summary>
+    public long Seq { get; set; }
 }

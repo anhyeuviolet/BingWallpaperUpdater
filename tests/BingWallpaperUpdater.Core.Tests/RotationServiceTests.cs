@@ -204,7 +204,15 @@ public sealed class RotationServiceTests : IDisposable
         });
     }
 
-    private static CachedImage Cached(string id, string date, int downloadedMinutesAfterT0 = 0, string resolution = "UHD", int width = 3840) => new()
+    /// <summary>Seeded entries were on disk before the app started at <see cref="T0"/>: they are stamped the day before.</summary>
+    private static readonly DateTimeOffset SeedT0 = T0.AddDays(-1);
+
+    /// <summary>
+    /// A pre-existing index entry. It carries no <see cref="CachedImage.Seq"/> (an index written by an earlier build),
+    /// so the decider's <c>DownloadedUtc</c> fallback is what orders it against images downloaded during the test —
+    /// which is why the stamp must precede <see cref="T0"/>.
+    /// </summary>
+    private static CachedImage Cached(string id, string date, int downloadedMinutesAfterSeedT0 = 0, string resolution = "UHD", int width = 3840) => new()
     {
         Id = id,
         Market = "EN-US",
@@ -214,7 +222,7 @@ public sealed class RotationServiceTests : IDisposable
         Height = width * 9 / 16,
         File = $"{date}_{id}.jpg",
         Bytes = 16,
-        DownloadedUtc = T0.AddMinutes(downloadedMinutesAfterT0),
+        DownloadedUtc = SeedT0.AddMinutes(downloadedMinutesAfterSeedT0),
     };
 
     /// <summary>Writes index.json and a 16-byte file per image (unless listed in <paramref name="missingFiles"/>), then loads the cache.</summary>
@@ -234,7 +242,7 @@ public sealed class RotationServiceTests : IDisposable
             }
         }
 
-        var cache = new ImageCache(_dir, _indexPath);
+        var cache = new ImageCache(_dir, _indexPath, _time);   // WR-01: DownloadedUtc comes from the same fake clock as the scheduler
         cache.Load();
         return cache;
     }
@@ -624,6 +632,48 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(2, h.Applier.Calls);                    // no second apply of FreshId
         Assert.Equal(3, LogCount("tick reason=Interval"));
         Assert.Equal(2, LogCount("tick done reason=Interval result=NoOp decision=NoOp why=unchanged"));
+        Assert.Equal(1, LogCount("cache add id=" + FreshId));
+        Assert.Equal(FreshId, SavedState()!.LastSeenNewestId);
+    }
+
+    [Fact]
+    public async Task SourceSwitch_ArchiveAhead_BackwardClockBetweenDownloads_NeverRegressesOrFlipFlops()
+    {
+        // WR-01 (iteration 2): the same source switch, but the clock is corrected back 3 h between the two
+        // downloads, so the genuinely newer FreshId carries an EARLIER DownloadedUtc than NewestId. Cache order
+        // (Seq) must decide "already known", not the wall clock (D-07).
+        var catalog = new Catalog();
+        Harness h = Build(Newest(), new AppState(), fake: Routes(catalog));
+        await StartAsync(h);                                 // README newest applied at T0
+        Assert.Equal(1, h.Applier.Calls);
+        DateTimeOffset newestStamp = h.Cache.Index.Images.Single(i => i.Id == NewestId).DownloadedUtc;
+        Assert.Equal(T0, newestStamp);
+
+        _time.AdjustTime(_time.GetUtcNow() - TimeSpan.FromHours(3));
+        h.Service.OnClockChanged();                          // NextDueUtc clamped to now + Interval
+
+        catalog.GitHubOnline = false;
+        catalog.Archive = ArchiveAhead();
+        await AdvanceAsync(h, Interval);                     // T0 - 2h30: HPImageArchive is the catalog, FreshId applied
+
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        CachedImage fresh = h.Cache.Index.Images.Single(i => i.Id == FreshId);
+        Assert.True(fresh.DownloadedUtc < newestStamp);      // the inverted stamp the old rule tripped on
+        Assert.True(fresh.Seq > h.Cache.Index.Images.Single(i => i.Id == NewestId).Seq);
+
+        catalog.GitHubOnline = true;                         // README still on yesterday's NewestId
+        await AdvanceAsync(h, Interval);
+
+        Assert.Equal(2, h.Applier.Calls);                    // no regression to the older image
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+
+        catalog.Body = MovedReadme();                        // the README catches up to FreshId
+        await AdvanceAsync(h, Interval);
+
+        Assert.Equal(2, h.Applier.Calls);                    // no second apply of FreshId
         Assert.Equal(1, LogCount("cache add id=" + FreshId));
         Assert.Equal(FreshId, SavedState()!.LastSeenNewestId);
     }

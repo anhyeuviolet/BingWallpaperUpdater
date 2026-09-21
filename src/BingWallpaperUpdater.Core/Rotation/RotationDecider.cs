@@ -176,9 +176,9 @@ public static class RotationDecider
 
     /// <summary>
     /// True when a catalog newest that differs from <c>LastSeenNewestId</c> is nevertheless not new (WR-01): it is
-    /// cached and was downloaded no later than the cached last-seen newest. The README and HPImageArchive do not roll
-    /// over at the same instant, so a source switch (GitHub failing, then recovering) can present yesterday's ID as
-    /// "newest" again; without this guard the desktop would regress to it and flip-flop once the README caught up.
+    /// cached and entered the cache no later than the cached last-seen newest. The README and HPImageArchive do not
+    /// roll over at the same instant, so a source switch (GitHub failing, then recovering) can present yesterday's ID
+    /// as "newest" again; without this guard the desktop would regress to it and flip-flop once the README caught up.
     /// An image that is cached but newer than the last-seen one (its download succeeded and its apply failed or
     /// threw) is still new, so the ladder retry can apply it; an uncached newest is always new; a last-seen entry no
     /// longer in the cache cannot vouch for anything, so the catalog newest is taken at face value.
@@ -192,8 +192,16 @@ public static class RotationDecider
         }
 
         int lastSeenIdx = IndexOf(candidates, lastSeenId);
-        return lastSeenIdx >= 0 && candidates[newestIdx].DownloadedUtc <= candidates[lastSeenIdx].DownloadedUtc;
+        return lastSeenIdx >= 0 && IsNoNewerThan(candidates[newestIdx], candidates[lastSeenIdx]);
     }
+
+    /// <summary>
+    /// Cache order, not wall-clock order: <see cref="CachedImage.Seq"/> when both entries carry one (assigned
+    /// monotonically by <c>ImageCache.Add</c>, so a backward clock change between two downloads cannot invert the
+    /// verdict — D-07), <see cref="CachedImage.DownloadedUtc"/> only when either entry predates the field.
+    /// </summary>
+    private static bool IsNoNewerThan(CachedImage a, CachedImage b) =>
+        a.Seq != 0 && b.Seq != 0 ? a.Seq <= b.Seq : a.DownloadedUtc <= b.DownloadedUtc;
 
     private static int IndexOf(IReadOnlyList<CachedImage> images, string? id)
     {

@@ -20,13 +20,20 @@ public sealed class ImageCache
 {
     private readonly string _cacheDir;
     private readonly string _indexPath;
+    private readonly TimeProvider _time;
 
-    public ImageCache(string cacheDir, string indexPath)
+    /// <param name="time">
+    /// The clock that stamps <see cref="CachedImage.DownloadedUtc"/> and dates fallback file names; defaults to
+    /// <see cref="TimeProvider.System"/>. Pass the same provider the scheduler uses so every timestamp the app
+    /// records comes from one clock.
+    /// </param>
+    public ImageCache(string cacheDir, string indexPath, TimeProvider? time = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(cacheDir);
         ArgumentException.ThrowIfNullOrEmpty(indexPath);
         _cacheDir = cacheDir;
         _indexPath = indexPath;
+        _time = time ?? TimeProvider.System;
     }
 
     /// <summary>Cap on validated images in the cache (CACHE-01); <c>.part</c> files never count.</summary>
@@ -42,6 +49,10 @@ public sealed class ImageCache
         Index = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex) ?? new CacheIndex();
         Index.Applied ??= [];
         Index.Images ??= [];
+
+        // NextSeq must stay above every Seq already handed out, whatever a hand-edited or older index says.
+        long maxSeq = Index.Images.Count == 0 ? 0 : Index.Images.Max(i => i.Seq);
+        Index.NextSeq = Math.Max(Math.Max(Index.NextSeq, 1), maxSeq + 1);
     }
 
     /// <summary>
@@ -108,7 +119,7 @@ public sealed class ImageCache
             return hit;
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset now = _time.GetUtcNow();
         string fileName = FileNameFor(entry, resolution, now);
         string finalPath = Path.Combine(_cacheDir, fileName);
         (int minW, int minH) = BingImageUrl.MinDimensions(resolution);
@@ -140,7 +151,7 @@ public sealed class ImageCache
             File = fileName,
             Bytes = result.Bytes,
             SourceUrl = url.ToString(),
-            DownloadedUtc = DateTimeOffset.UtcNow,
+            DownloadedUtc = _time.GetUtcNow(),
         };
 
         Add(cached);
@@ -149,7 +160,8 @@ public sealed class ImageCache
     }
 
     /// <summary>
-    /// Appends <paramref name="image"/> (replacing any entry with the same id + resolution), evicts down to
+    /// Appends <paramref name="image"/> (replacing any entry with the same id + resolution), stamps it with the next
+    /// <see cref="CachedImage.Seq"/> so cache order never depends on the wall clock (WR-01), evicts down to
     /// <see cref="MaxImages"/> with <c>Applied ∪ {image.Id}</c> protected, deletes each victim's file best-effort
     /// — unless a surviving entry still names that file, in which case the bytes stay — logs <c>evict id= file=</c>
     /// per victim, and saves the index exactly once at the end.
@@ -162,6 +174,7 @@ public sealed class ImageCache
             string.Equals(i.Id, image.Id, StringComparison.Ordinal)
             && string.Equals(i.Resolution, image.Resolution, StringComparison.Ordinal));
         Index.Images.RemoveAll(replaced.Contains);
+        image.Seq = Index.NextSeq++;
         Index.Images.Add(image);
 
         var protectedIds = new HashSet<string>(Index.Applied, StringComparer.Ordinal) { image.Id };
