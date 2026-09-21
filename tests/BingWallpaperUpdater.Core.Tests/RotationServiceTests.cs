@@ -32,6 +32,10 @@ public sealed class RotationServiceTests : IDisposable
     private const string MiddleId = "OHR.IcyCubs_EN-US5222104616";          // 2026-09-17
     private const string OldestId = "OHR.MisurinaPeak_EN-US4897144498";     // 2026-09-14
 
+    // Not in README.sample.md: the row MovedReadme() prepends when a test needs the catalog to move by a day.
+    private const string FreshId = "OHR.ParisSunset_EN-US6532307523";       // 2026-09-21
+    private const string MovedEtag = "\"readme-v2\"";
+
     private static readonly DateTimeOffset T0 = new(2026, 9, 20, 6, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(30);
 
@@ -97,6 +101,64 @@ public sealed class RotationServiceTests : IDisposable
         }
 
         return fake;
+    }
+
+    /// <summary>
+    /// Mutable catalog sources for <see cref="Routes(Catalog)"/>: swap <see cref="Body"/> mid-test to make the README
+    /// move, flip <see cref="GitHubOnline"/> to take GitHub away, swap <see cref="Archive"/> to move HPImageArchive.
+    /// </summary>
+    private sealed class Catalog
+    {
+        public bool GitHubOnline { get; set; } = true;
+        public string Body { get; set; } = Fixture("README.sample.md");
+        public string Archive { get; set; } = Fixture("hpimagearchive.sample.json");
+    }
+
+    /// <summary>
+    /// The same routes as <see cref="Routes(string?)"/>, but both catalog bodies are read from <paramref name="catalog"/>
+    /// on every request. The README carries an ETag per body version, so a swapped body answers 200 with the new ETag
+    /// while an unchanged one keeps answering 304 to If-None-Match; GitHub throws like <see cref="Offline"/> while
+    /// <see cref="Catalog.GitHubOnline"/> is false.
+    /// </summary>
+    private static FakeHttpHandler Routes(Catalog catalog)
+    {
+        string original = Fixture("README.sample.md");
+        var fake = new FakeHttpHandler();
+        fake.Map(GitHubHost, "/", req =>
+        {
+            if (!catalog.GitHubOnline)
+            {
+                throw new HttpRequestException("simulated github outage");
+            }
+
+            string body = catalog.Body;
+            string etag = string.Equals(body, original, StringComparison.Ordinal) ? Etag : MovedEtag;
+            return req.Headers.IfNoneMatch.Any(t => string.Equals(t.Tag, etag, StringComparison.Ordinal))
+                ? FakeHttpHandler.Text(304, string.Empty, etag)
+                : FakeHttpHandler.Text(200, body, etag);
+        });
+        foreach (string host in new[] { BingImageUrl.PrimaryHost, BingImageUrl.RetryHost })
+        {
+            fake.Map(host, ArchivePath, _ => FakeHttpHandler.Json(200, catalog.Archive));
+            fake.Map(host, ImagePath, _ => FakeHttpHandler.Bytes(200, "image/jpeg", JpegBytes.Sof0(3840, 2160)));
+        }
+
+        return fake;
+    }
+
+    /// <summary>hpimagearchive.sample.json with its newest entry renamed to <see cref="FreshId"/>: HPImageArchive rolled over a day before the README did.</summary>
+    private static string ArchiveAhead() => Fixture("hpimagearchive.sample.json").Replace(NewestId, FreshId, StringComparison.Ordinal);
+
+    /// <summary>README.sample.md with one row (<see cref="FreshId"/>, 2026-09-21) inserted ahead of every existing row: the catalog moved by a day.</summary>
+    private static string MovedReadme()
+    {
+        string body = Fixture("README.sample.md");
+        const string headerRow = "| :----: | :----: | :----: |";
+        int at = body.IndexOf(headerRow, StringComparison.Ordinal);
+        Assert.True(at >= 0, "README.sample.md table header not found");
+        int lineEnd = body.IndexOf('\n', at) + 1;
+        string row = $"|![](https://cn.bing.com/th?id={FreshId}_UHD.jpg&pid=hp&w=384&h=216&rs=1&c=4)2026-09-21 [download 4k](https://cn.bing.com/th?id={FreshId}_UHD.jpg&rf=LaDigue_UHD.jpg&pid=hp&w=3840&h=2160&rs=1&c=4)|\n";
+        return body.Insert(lineEnd, row);
     }
 
     /// <summary>Every host unreachable: the single responder throws <see cref="HttpRequestException"/> for every request (both catalog sources and both image hosts).</summary>
@@ -522,6 +584,48 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(MiddleId, h.State.CurrentImageId);
         Assert.Equal(NewestId, h.State.LastSeenNewestId);
         Assert.Contains("tick done reason=Interval result=NoOp decision=NoOp why=unchanged", LogText());
+    }
+
+    [Fact]
+    public async Task SourceSwitch_ArchiveAhead_GitHubRecovers_NeverRegressesOrFlipFlops()
+    {
+        // WR-01: the README and HPImageArchive do not roll over at the same instant. The archive already lists
+        // FreshId while the README still lists NewestId; a GitHub outage applies FreshId once, GitHub recovering must
+        // NOT re-apply the older NewestId, and the README catching up must NOT apply FreshId a second time.
+        var catalog = new Catalog();
+        Harness h = Build(Newest(), new AppState(), fake: Routes(catalog));
+        await StartAsync(h);                                 // README newest applied at T0
+        Assert.Equal(1, h.Applier.Calls);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+
+        catalog.GitHubOnline = false;
+        catalog.Archive = ArchiveAhead();
+        await AdvanceAsync(h, Interval);                     // T0 + 30: HPImageArchive is the catalog, its newest is genuinely unseen
+
+        Assert.Equal(2, h.Applier.Calls);
+        Assert.Contains("ParisSunset", h.Applier.LastPath!, StringComparison.Ordinal);
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Contains("catalog source=hpimagearchive", LogText());
+        Assert.Contains("tick done reason=Interval result=Applied decision=ApplyNew why=new", LogText());
+
+        catalog.GitHubOnline = true;                         // README still on yesterday's NewestId
+        await AdvanceAsync(h, Interval);                     // T0 + 60
+
+        Assert.Equal(2, h.Applier.Calls);                    // no regression to the older image
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(2, LogCount("tick reason=Interval"));
+        Assert.Equal(1, LogCount("tick done reason=Interval result=NoOp decision=NoOp why=unchanged"));
+
+        catalog.Body = MovedReadme();                        // the README catches up to FreshId
+        await AdvanceAsync(h, Interval);                     // T0 + 90
+
+        Assert.Equal(2, h.Applier.Calls);                    // no second apply of FreshId
+        Assert.Equal(3, LogCount("tick reason=Interval"));
+        Assert.Equal(2, LogCount("tick done reason=Interval result=NoOp decision=NoOp why=unchanged"));
+        Assert.Equal(1, LogCount("cache add id=" + FreshId));
+        Assert.Equal(FreshId, SavedState()!.LastSeenNewestId);
     }
 
     [Fact]
@@ -1039,20 +1143,22 @@ public sealed class RotationServiceTests : IDisposable
 
     /// <summary>
     /// Three images cached with the middle one on the desktop and the catalog already seen: the Startup tick is a
-    /// not-due NoOp. The test then pretends the catalog moved since the last look (smoke S8's textual-fixture trick)
-    /// so the interval-due tick decides ApplyNew with a cache hit on the newest image.
+    /// not-due NoOp. The README then gains a row newer than everything cached (<see cref="FreshId"/>, with a new
+    /// ETag so the next conditional GET is a 200), so the interval-due tick decides ApplyNew for an image it has to
+    /// download first. <c>LastSeenNewestId</c> is never written by the test: it stays on the service's own D-03 path.
     /// </summary>
     private async Task<Harness> StartNotDueWithMiddleApplied_ThenCatalogMoved(ImageCache? cache = null)
     {
         cache ??= SeedCache(ThreeCached(), applied: MiddleId);
         var state = new AppState { CurrentImageId = MiddleId, LastSeenNewestId = NewestId, NextDueUtc = T0 + Interval };
-        Harness h = Build(Newest(), state, cache);
+        var catalog = new Catalog();
+        Harness h = Build(Newest(), state, cache, Routes(catalog));
 
         await StartAsync(h);
         Assert.Equal(0, h.Applier.Calls);
         Assert.Contains("tick done reason=Startup result=NoOp decision=NoOp why=not-due", LogText());
 
-        h.State.LastSeenNewestId = MiddleId;   // no tick is running; the fake clock only fires inside Advance
+        catalog.Body = MovedReadme();   // no tick is running; the fake clock only fires inside Advance
         return h;
     }
 
@@ -1062,15 +1168,16 @@ public sealed class RotationServiceTests : IDisposable
         Harness h = await StartNotDueWithMiddleApplied_ThenCatalogMoved();
         h.Applier.ThrowNext = new InvalidOperationException("simulated COM failure");
 
-        await AdvanceAsync(h, Interval);   // the interval-due tick at T0 + 30 min: cache hit on NewestId, applier throws
+        await AdvanceAsync(h, Interval);   // the interval-due tick at T0 + 30 min: FreshId downloaded, applier throws
 
         DateTimeOffset now = _time.GetUtcNow();
         Assert.Equal(1, LogCount("tick reason=Interval"));
         Assert.Equal(1, h.Applier.Calls);
-        Assert.Contains("AlphornBavaria", h.Applier.LastPath!, StringComparison.Ordinal);
+        Assert.Contains("ParisSunset", h.Applier.LastPath!, StringComparison.Ordinal);
+        Assert.Equal(1, LogCount("cache add id=" + FreshId));
         Assert.Contains("tick failed reason=Interval error=simulated COM failure", LogText());
         Assert.Contains("tick done reason=Interval result=Failed decision=ApplyNew why=new", LogText());
-        Assert.Equal(MiddleId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);   // written only after a successful apply (D-03)
         Assert.Equal(MiddleId, h.State.CurrentImageId, StringComparer.Ordinal);
         Assert.Equal(new[] { MiddleId }, h.Cache.Index.Applied);          // ApplyStage rolled the record back before rethrowing
         Assert.Equal(now + Interval, h.Service.NextDueUtc);                 // re-armed despite the throw (G-01)
@@ -1091,8 +1198,9 @@ public sealed class RotationServiceTests : IDisposable
 
         Assert.Equal(1, LogCount("tick reason=Retry"));
         Assert.Equal(2, h.Applier.Calls);
-        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
-        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(1, LogCount("cache add id=" + FreshId));             // the retry is a cache hit: the image is newer than the last-seen one, so it is still "new" (WR-01)
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
         Assert.Contains("tick done reason=Retry result=Applied decision=ApplyNew why=new", LogText());
         Assert.Equal(0, h.Service.FailureStage);
         Assert.Null(h.Service.RetryDueUtc);
@@ -1115,7 +1223,7 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Contains("apply failed method=fake error=forced failure", LogText());
         Assert.Contains("tick done reason=Interval result=ApplyFailed decision=ApplyNew why=new", LogText());
         Assert.Equal(0, LogCount("tick failed"));
-        Assert.Equal(MiddleId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);   // not advanced by a failed apply (D-03)
         Assert.Equal(MiddleId, h.State.CurrentImageId, StringComparer.Ordinal);
         Assert.Equal(new[] { MiddleId }, h.Cache.Index.Applied);
         Assert.Equal(now + Interval, h.Service.NextDueUtc);
@@ -1128,12 +1236,13 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(2, LogCount("tick reason="));
         Assert.Equal(1, h.Applier.Calls);
 
-        await AdvanceAsync(h, Interval - TimeSpan.FromMinutes(5));   // the next interval-due tick applies the image
+        await AdvanceAsync(h, Interval - TimeSpan.FromMinutes(5));   // the next interval-due tick applies the image (cache hit)
 
         Assert.Equal(2, LogCount("tick reason=Interval"));
         Assert.Equal(2, h.Applier.Calls);
-        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
-        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(1, LogCount("cache add id=" + FreshId));
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
         Assert.Contains("tick done reason=Interval result=Applied decision=ApplyNew why=new", LogText());
     }
 
@@ -1182,7 +1291,7 @@ public sealed class RotationServiceTests : IDisposable
         // FileMode.Create, so a directory in that place makes the FileStream constructor throw
         // (UnauthorizedAccessException — the same family as a locked or read-only index.json). The throw site is
         // ImageCache.Add -> Save() at the end of EnsureAsync, after the download succeeded and before the applier.
-        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")], applied: MiddleId);   // NewestId is NOT cached
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")], applied: MiddleId);   // FreshId is NOT cached
         Harness h = await StartNotDueWithMiddleApplied_ThenCatalogMoved(cache);
         string tmpBlocker = _indexPath + ".tmp";
         Directory.CreateDirectory(tmpBlocker);
@@ -1195,11 +1304,11 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(0, LogCount("cache add"));            // Add threw before its log line
         Assert.Contains("tick failed reason=Interval error=", LogText());
         Assert.Contains("tick done reason=Interval result=Failed decision=ApplyNew why=new", LogText());
-        Assert.Equal(MiddleId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);   // untouched: nothing was applied (D-03)
         Assert.Equal(MiddleId, h.State.CurrentImageId, StringComparer.Ordinal);
         CacheIndex onDisk = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!;
         Assert.Equal(new[] { MiddleId }, onDisk.Applied);
-        Assert.DoesNotContain(onDisk.Images, i => string.Equals(i.Id, NewestId, StringComparison.Ordinal));   // the failed Add never reached disk
+        Assert.DoesNotContain(onDisk.Images, i => string.Equals(i.Id, FreshId, StringComparison.Ordinal));   // the failed Add never reached disk
         Assert.Equal(now1 + Interval, h.Service.NextDueUtc);
         Assert.Equal(now1 + Interval, SavedState()!.NextDueUtc);   // state.json has its own .tmp, so the tail's save works
         Assert.Equal(1, h.Service.FailureStage);
@@ -1226,14 +1335,14 @@ public sealed class RotationServiceTests : IDisposable
 
         Assert.Equal(2, LogCount("tick reason=Retry"));
         Assert.Equal(1, h.Applier.Calls);
-        Assert.Equal(NewestId, h.State.CurrentImageId, StringComparer.Ordinal);
-        Assert.Equal(NewestId, h.State.LastSeenNewestId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.CurrentImageId, StringComparer.Ordinal);
+        Assert.Equal(FreshId, h.State.LastSeenNewestId, StringComparer.Ordinal);
         Assert.Contains("tick done reason=Retry result=Applied decision=ApplyNew why=new", LogText());
         Assert.Equal(0, h.Service.FailureStage);
         Assert.Null(h.Service.RetryDueUtc);
         Assert.Equal(now1 + Interval, h.Service.NextDueUtc);
         onDisk = AtomicJsonFile.Load(_indexPath, CoreJsonContext.Default.CacheIndex)!;
-        Assert.Equal(new[] { NewestId }, onDisk.Applied);
+        Assert.Equal(new[] { FreshId }, onDisk.Applied);
     }
 
     [Fact]

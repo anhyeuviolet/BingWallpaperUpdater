@@ -78,6 +78,71 @@ public sealed class RotationDeciderTests
         Assert.Equal("new", d.Why);
     }
 
+    // ---- WR-01: a source switch must not present an older, already-downloaded ID as "new" ------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SourceSwitch_OlderNewestDownloadedBeforeLastSeen_NotNew(bool randomMode)
+    {
+        // The README still lists the middle image while HPImageArchive already served (and the app applied) the
+        // newest: the older ID is cached and was downloaded before the last-seen one, so it is not new.
+        RotationDecision d = Decide(TickReason.Interval, randomMode, Entry(MiddleId), Current(NewestId, NewestId), Three());
+
+        Assert.NotEqual(DecisionKind.ApplyNew, d.Kind);
+        if (randomMode)
+        {
+            Assert.Equal(DecisionKind.Random, d.Kind);   // the interval rotation still runs (R6)
+        }
+        else
+        {
+            Assert.Equal(DecisionKind.NoOp, d.Kind);
+            Assert.Equal("unchanged", d.Why);
+        }
+    }
+
+    [Fact]
+    public void SourceSwitch_OlderNewest_AfterUserStepBack_NotNew()
+    {
+        // The user stepped back to the middle image and GitHub recovers with yesterday's ID: nothing to apply.
+        RotationDecision d = Decide(TickReason.Interval, false, Entry(MiddleId), Current(MiddleId, NewestId), Three());
+
+        Assert.Equal(DecisionKind.NoOp, d.Kind);
+        Assert.Equal("unchanged", d.Why);
+    }
+
+    [Fact]
+    public void CachedNewestDownloadedAfterLastSeen_StillApplyNew_OnRetry()
+    {
+        // The newest was downloaded but its apply failed or threw: it is cached and newer than the last-seen entry,
+        // so the ladder Retry must still apply it (R2 before R4).
+        RotationDecision d = Decide(TickReason.Retry, false, Entry(NewestId), Current(MiddleId, MiddleId), Three());
+
+        Assert.Equal(DecisionKind.ApplyNew, d.Kind);
+        Assert.Equal(NewestId, d.Entry!.Id.Value);
+        Assert.Equal("new", d.Why);
+    }
+
+    [Fact]
+    public void CachedNewest_LastSeenNotCached_ApplyNew()
+    {
+        // A last-seen entry that is no longer cached cannot vouch for the catalog newest (smoke S8's fake ID).
+        RotationDecision d = Decide(TickReason.Startup, false, Entry(NewestId), Current(NewestId, FreshId), Three());
+
+        Assert.Equal(DecisionKind.ApplyNew, d.Kind);
+        Assert.Equal("new", d.Why);
+    }
+
+    [Fact]
+    public void UncachedNewest_AlwaysApplyNew()
+    {
+        RotationDecision d = Decide(TickReason.Interval, false, Entry(FreshId), Current(MiddleId, NewestId), Three());
+
+        Assert.Equal(DecisionKind.ApplyNew, d.Kind);
+        Assert.Equal(FreshId, d.Entry!.Id.Value);
+        Assert.Equal("new", d.Why);
+    }
+
     [Fact]
     public void Phase1Upgrade_LastSeenNull_CurrentEqualsNewest_SeedLastSeen()
     {

@@ -79,7 +79,7 @@ public static class RotationDecider
     /// The decision table, rows evaluated top to bottom (the exact order is a contract; see the tests):
     /// <list type="number">
     /// <item>R1 upgrade guard: no <c>LastSeenNewestId</c> yet and the current image is the catalog newest with its file present -> <c>SeedLastSeen</c>.</item>
-    /// <item>R2 catalog newest differs from <c>LastSeenNewestId</c> -> <c>ApplyNew</c> (D-03; both modes, D-04).</item>
+    /// <item>R2 catalog newest differs from <c>LastSeenNewestId</c> and is not already known (see <see cref="AlreadyKnown"/>) -> <c>ApplyNew</c> (D-03; both modes, D-04).</item>
     /// <item>R3 current image missing (null ID or file gone) -> newest from the catalog, else newest cached, else <c>NoOp(empty-cache)</c> (D-11).</item>
     /// <item>R4 <see cref="TickReason.Retry"/> never rotates -> <c>NoOp(retry)</c> (D-13).</item>
     /// <item>R5 <see cref="TickReason.Next"/> with two or more candidates -> step older / random other; otherwise <c>NoOp(single-image)</c> (D-05, D-15).</item>
@@ -114,7 +114,9 @@ public static class RotationDecider
         }
 
         // R2
-        if (newest is not null && !string.Equals(newest.Id.Value, state.LastSeenNewestId, StringComparison.Ordinal))
+        if (newest is not null
+            && !string.Equals(newest.Id.Value, state.LastSeenNewestId, StringComparison.Ordinal)
+            && !AlreadyKnown(newest.Id.Value, state.LastSeenNewestId, candidates))
         {
             return new RotationDecision(DecisionKind.ApplyNew, newest, null, "new");
         }
@@ -171,6 +173,27 @@ public static class RotationDecider
         target is null
             ? new RotationDecision(DecisionKind.NoOp, null, null, "single-image")
             : new RotationDecision(kind, null, target, why);
+
+    /// <summary>
+    /// True when a catalog newest that differs from <c>LastSeenNewestId</c> is nevertheless not new (WR-01): it is
+    /// cached and was downloaded no later than the cached last-seen newest. The README and HPImageArchive do not roll
+    /// over at the same instant, so a source switch (GitHub failing, then recovering) can present yesterday's ID as
+    /// "newest" again; without this guard the desktop would regress to it and flip-flop once the README caught up.
+    /// An image that is cached but newer than the last-seen one (its download succeeded and its apply failed or
+    /// threw) is still new, so the ladder retry can apply it; an uncached newest is always new; a last-seen entry no
+    /// longer in the cache cannot vouch for anything, so the catalog newest is taken at face value.
+    /// </summary>
+    private static bool AlreadyKnown(string newestId, string? lastSeenId, IReadOnlyList<CachedImage> candidates)
+    {
+        int newestIdx = IndexOf(candidates, newestId);
+        if (newestIdx < 0)
+        {
+            return false;
+        }
+
+        int lastSeenIdx = IndexOf(candidates, lastSeenId);
+        return lastSeenIdx >= 0 && candidates[newestIdx].DownloadedUtc <= candidates[lastSeenIdx].DownloadedUtc;
+    }
 
     private static int IndexOf(IReadOnlyList<CachedImage> images, string? id)
     {

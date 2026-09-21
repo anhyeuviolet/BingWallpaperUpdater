@@ -16,8 +16,12 @@
 #   S2  single instance       a second launch leaves exactly one process
 #   S3  NoOp restart          raw.githubusercontent.com 304, cache hit, no cache add, no large Bing download,
 #                             tick done result=NoOp decision=NoOp, no apply ok, nextDueUtc unchanged
-#   S4  GitHub blocked        BWU_CATALOG_URL -> 404 path; catalog source=hpimagearchive; decision=NoOp; no apply ok
-#   S5  hand-deleted file     reconcile dropped=1, fresh cache add, apply ok, decision=ApplyNew why=missing-current
+#   S4  GitHub blocked        BWU_CATALOG_URL -> 404 path; catalog source=hpimagearchive; decision=NoOp and no apply ok
+#                             (or, when HPImageArchive is a day ahead of the README, ApplyNew why=new exactly once);
+#                             then GitHub back -> decision=NoOp, no apply ok (the older README newest is never re-applied)
+#   S5  hand-deleted file     the applied image's file removed -> reconcile dropped=1, apply ok, decision=ApplyNew
+#                             (why=missing-current with a fresh cache add; why=new served from the cache when the
+#                             deleted image was HPImageArchive's day-ahead newest)
 #   S6  host set              every "http <host>" line across S1-S5 is on the allow-list
 #   S7  data folder           no *.tmp/*.part, settings.json market/interval/mode, state.json scheduler fields,
 #                             state.json currentImageId == applied[0]
@@ -371,19 +375,61 @@ $log = @(Read-Log)
 Assert-LogContains $log 'http raw.githubusercontent.com 404 ' 'override URL answered 404' | Out-Null
 Assert-LogContains $log 'catalog github failed' 'GitHub source reported as failed' | Out-Null
 Assert-LogContains $log 'catalog source=hpimagearchive' 'HPImageArchive became the catalog' | Out-Null
-Assert-TickField $tickLine 'decision' 'NoOp'
-Assert-LogLacks $log 'apply ok' 'HPImageArchive newest equals lastSeenNewestId, so the desktop is untouched'
+# The two sources do not roll over at the same instant (WR-01). Most of the day they agree and the fallback is a
+# NoOp; in the window where HPImageArchive already lists today's image and the README still lists yesterday's, the
+# archive's newest is genuinely unseen and is applied exactly once (why=new). Both are correct. The deterministic
+# part is the second half: once GitHub is back, the README's older ID must not be re-applied (no flip-flop).
+$decision4 = Get-TickField $tickLine 'decision'
+$archiveAhead = $false
+$appliedId4 = $appliedId
+switch ($decision4) {
+    'NoOp' {
+        Assert-LogLacks $log 'apply ok' 'HPImageArchive newest equals lastSeenNewestId, so the desktop is untouched'
+    }
+    'ApplyNew' {
+        $archiveAhead = $true
+        Assert-TickField $tickLine 'why' 'new'
+        Assert-TickField $tickLine 'result' 'Applied'
+        $applyLine4 = Assert-LogContains $log 'apply ok' 'HPImageArchive is a day ahead of the README: its newest is applied once'
+        $appliedId4 = Get-AppliedId $applyLine4
+        if ($appliedId4 -eq $appliedId) { Fail "HPImageArchive re-applied the README newest $appliedId" }
+        Wait-Applied $appliedId4
+    }
+    default { Fail "tick line has decision=$decision4, expected NoOp or ApplyNew: $tickLine" }
+}
 Stop-App
 Save-LogCopy 'S4'
 Write-Host "  tick: $tickLine"
-Write-Host 'PASS S4 github blocked -> hpimagearchive fallback, no re-apply'
+
+# GitHub back, README unchanged since S1: its newest is already cached no later than the last-seen one -> NoOp.
+Remove-LogOnly
+$proc = Start-App
+$tickLine = Wait-TickDone 'Startup' $proc
+$log = @(Read-Log)
+Assert-LogContains $log 'catalog source=github' 'GitHub is the catalog again' | Out-Null
+Assert-TickField $tickLine 'decision' 'NoOp'
+Assert-LogLacks $log 'apply ok' 'GitHub recovering must not re-apply an older README newest (no flip-flop)'
+$state4 = Read-State
+if ($state4.currentImageId -ne $appliedId4) { Fail "state.json currentImageId is '$($state4.currentImageId)' after GitHub recovered, expected $appliedId4" }
+Stop-App
+Save-LogCopy 'S4b'
+Write-Host "  tick: $tickLine"
+if ($archiveAhead) { Write-Host 'PASS S4 github blocked -> hpimagearchive fallback (a day ahead: applied once); github back -> no flip-flop' }
+else { Write-Host 'PASS S4 github blocked -> hpimagearchive fallback, no re-apply; github back -> no flip-flop' }
 
 # ---- S5 hand-deleted file reconcile ---------------------------------------------------------------------
 
 $script:currentScenario = 'S5'
-$jpgs = @(Get-CacheJpegs)
-if ($jpgs.Count -ne 1) { Fail "expected exactly 1 *.jpg before the delete, found $($jpgs.Count)" }
-Remove-Item $jpgs[0].FullName -Force
+# Delete the file of the image on the desktop (index applied[0]). After S4 the cache holds one image, or two when
+# HPImageArchive was a day ahead; the count is only required to be consistent across the reconcile below.
+$index5 = Read-Index
+$imagesBefore5 = @($index5.images).Count
+$currentId5 = [string]@($index5.applied)[0]
+$entry5 = @($index5.images) | Where-Object { $_.id -eq $currentId5 } | Select-Object -First 1
+if (-not $entry5) { Fail "index.json has no image entry for applied[0] '$currentId5'" }
+$file5Before = Join-Path $cacheDir $entry5.file
+if (-not (Test-Path $file5Before)) { Fail "applied image file is missing before the delete: $file5Before" }
+Remove-Item $file5Before -Force
 Remove-LogOnly
 $proc = Start-App
 $applyLine = Wait-LogLine -Pattern ' INFO apply ok ' -Process $proc
@@ -391,28 +437,43 @@ $appliedId5 = Get-AppliedId $applyLine
 Wait-Applied $appliedId5
 $tickLine = Wait-TickDone 'Startup' $proc 30
 Assert-TickField $tickLine 'decision' 'ApplyNew'
-Assert-TickField $tickLine 'why' 'missing-current'
 $log = @(Read-Log)
 $reconcileLine = Assert-LogContains $log 'reconcile dropped=1' 'missing file dropped from the index'
-$addLine = Assert-LogContains $log 'cache add id=' 'image re-downloaded'
 $reconcileAt = [array]::IndexOf($log, $reconcileLine)
-$addAt = [array]::IndexOf($log, $addLine)
 $applyAt = [array]::IndexOf($log, $applyLine)
-if (-not ($reconcileAt -lt $addAt -and $addAt -lt $applyAt)) { Fail "expected order reconcile ($reconcileAt) < cache add ($addAt) < apply ok ($applyAt)" }
+$why5 = Get-TickField $tickLine 'why'
+$expectedImages5 = $imagesBefore5
+if ($why5 -eq 'missing-current') {
+    # The catalog newest is the missing image: re-downloaded, then applied.
+    $addLine = Assert-LogContains $log 'cache add id=' 'image re-downloaded'
+    $addAt = [array]::IndexOf($log, $addLine)
+    if (-not ($reconcileAt -lt $addAt -and $addAt -lt $applyAt)) { Fail "expected order reconcile ($reconcileAt) < cache add ($addAt) < apply ok ($applyAt)" }
+} elseif ($archiveAhead -and $why5 -eq 'new') {
+    # The deleted image was HPImageArchive's day-ahead newest and the README still lists yesterday's: with the
+    # last-seen entry gone from the cache nothing vouches for the README newest, so it is applied from its cached file.
+    Assert-LogContains $log 'cache hit id=' 'README newest served from the cache' | Out-Null
+    Assert-LogLacks $log 'cache add' 'nothing re-downloaded: the README newest was still cached'
+    if (-not ($reconcileAt -lt $applyAt)) { Fail "expected order reconcile ($reconcileAt) < apply ok ($applyAt)" }
+    $expectedImages5 = $imagesBefore5 - 1
+} else {
+    Fail "tick line has why=$why5, expected missing-current (or new after a day-ahead HPImageArchive apply): $tickLine"
+}
 $index = Read-Index
-if (@($index.images).Count -ne 1) { Fail "index.json images.Count is $(@($index.images).Count) after reconcile, expected 1" }
-$file5 = Join-Path $cacheDir (@($index.images)[0].file)
+if (@($index.images).Count -ne $expectedImages5) { Fail "index.json images.Count is $(@($index.images).Count) after reconcile, expected $expectedImages5" }
+$entry5After = @($index.images) | Where-Object { $_.id -eq $appliedId5 } | Select-Object -First 1
+if (-not $entry5After) { Fail "index.json has no image entry for the applied id $appliedId5" }
+$file5 = Join-Path $cacheDir $entry5After.file
 if (-not (Test-Path $file5)) { Fail "index.json points at a missing file: $file5" }
 Stop-App
 Save-LogCopy 'S5'
 Write-Host "  tick: $tickLine"
-Write-Host 'PASS S5 hand-deleted file -> reconcile dropped=1, fresh cache add, apply ok (ApplyNew why=missing-current)'
+Write-Host "PASS S5 hand-deleted file -> reconcile dropped=1, apply ok (ApplyNew why=$why5)"
 
 # ---- S6 host set ----------------------------------------------------------------------------------------
 
 $script:currentScenario = 'S6'
 $allLines = @()
-foreach ($s in 'S1', 'S3', 'S4', 'S5') {
+foreach ($s in 'S1', 'S3', 'S4', 'S4b', 'S5') {
     $copy = Join-Path $data "log.$s.txt"
     if (-not (Test-Path $copy)) { Fail "log copy $copy missing" }
     $allLines += @(Get-Content $copy)
