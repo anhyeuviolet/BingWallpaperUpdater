@@ -1926,6 +1926,39 @@ public sealed class RotationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task OnDisplayChanged_PerMonitor_ReapplyFails_SetNotCommitted_SameSetRetriesNextSignal()
+    {
+        Harness h = await PerMonitorAppliedAsync();
+
+        h.Applier.Monitors.Add(ThirdMonitor);   // docked a third display...
+        h.Applier.FailNext = true;              // ...while the shell is still reconfiguring: this re-apply fails
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(2, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(1, LogCount("reapply reason=display monitors=3 result=Failed"));
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);   // RunPerMonitor restored the previous Applied list
+
+        // The same three monitors signal again (a DPI change, the shell settling): the failed layout is retried, not
+        // skipped as unchanged — the attached set is committed only after a SUCCESSFUL apply (WR-04).
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(3, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(3, h.Applier.PerMonitorCalls[2].Count);
+        Assert.Equal(0, LogCount("reapply skipped reason=display cause=unchanged"));
+        Assert.Equal(1, LogCount("reapply reason=display monitors=3 result=Applied"));
+        Assert.Equal([NewestId, MiddleId, OldestId], h.Cache.Index.Applied);
+
+        // Now the set IS committed: one more signal with the same three monitors is the unchanged case.
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(3, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=unchanged"));
+    }
+
+    [Fact]
     public async Task OnDisplayChanged_SameMode_Skips()
     {
         ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17")]);

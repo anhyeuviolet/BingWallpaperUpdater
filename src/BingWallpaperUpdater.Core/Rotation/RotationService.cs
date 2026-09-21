@@ -48,7 +48,7 @@ public sealed class RotationService : IDisposable
     private int _failureStage;               // 0 after any successful fetch; +1 per failed fetch
     private int _appliedIntervalMinutes;     // the interval the current NextDueUtc was computed with (ApplySettings, D-07)
     private LastErrorKind _lastError;        // what the last tick left for the window's last-error line (UI-04); guarded by _sync
-    private string[] _lastAttachedSet = [];  // sorted device paths of the monitors the last apply set (WALL-03); UI thread only, never persisted
+    private string[] _lastAttachedSet = [];  // sorted device paths of the monitors the last SUCCESSFUL apply set (WALL-03, WR-04); UI thread only, never persisted
     // The MonitorMode the desktop currently reflects — written only by the constructor and after a SUCCESSFUL apply
     // (TickCoreAsync step 4, RunReapplyAsync); a skipped or failed re-apply never commits it, so the next ApplySettings
     // still sees the difference and retries (WR-01). Guarded by _sync.
@@ -775,7 +775,13 @@ public sealed class RotationService : IDisposable
         }
 
         ApplyResult result = ApplyStage.RunPerMonitor(_applier, monitors, plan, _cache, _state, _statePath, appliedUtc);
-        _lastAttachedSet = DeviceSet(monitors);
+        if (result.Ok)
+        {
+            // Commit-on-success, like _appliedMonitorMode (WR-01): a failed apply leaves the previous set in place so
+            // the next display signal with the same monitors is retried instead of skipped as unchanged (WR-04).
+            _lastAttachedSet = DeviceSet(monitors);
+        }
+
         return result;
     }
 
@@ -890,7 +896,10 @@ public sealed class RotationService : IDisposable
                 else
                 {
                     result = ApplyStage.Run(_applier, primaryPath, primaryId, _cache, _state, _statePath, appliedUtc);
-                    _lastAttachedSet = set;
+                    if (result.Ok)
+                    {
+                        _lastAttachedSet = set;   // commit-on-success (WR-04); a failed apply keeps the set retryable
+                    }
                 }
 
                 return (result, monitors.Count, mode);
