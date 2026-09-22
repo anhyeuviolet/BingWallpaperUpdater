@@ -50,7 +50,11 @@ certutil -hashfile BingWallpaperUpdater-<version>-x64-Setup.exe SHA256
 
 The hex string must equal the first field of `BingWallpaperUpdater-<version>-x64-Setup.exe.sha256`. The installer is built only by GitHub Actions from the version tag; the workflow run is linked from each release.
 
-Build provenance (`gh attestation verify BingWallpaperUpdater-<version>-x64-Setup.exe -R anhyeuviolet/BingWallpaperUpdater`) is generated only for tags built while the repository is public. The repository was private when the first release was built, so that release has no attestation; later releases will, once the repository is public.
+Every release also carries a GitHub build-provenance attestation, which proves the file came from this repository's workflow:
+
+```powershell
+gh attestation verify BingWallpaperUpdater-<version>-x64-Setup.exe -R anhyeuviolet/BingWallpaperUpdater
+```
 
 ## What it touches
 

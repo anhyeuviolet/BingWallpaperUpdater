@@ -50,7 +50,11 @@ certutil -hashfile BingWallpaperUpdater-<version>-x64-Setup.exe SHA256
 
 Chuỗi hex phải trùng với trường đầu tiên trong `BingWallpaperUpdater-<version>-x64-Setup.exe.sha256`. Bộ cài chỉ được GitHub Actions dựng từ thẻ phiên bản; mỗi bản phát hành có liên kết tới lần chạy workflow tương ứng.
 
-Chứng thực nguồn gốc bản dựng (`gh attestation verify BingWallpaperUpdater-<version>-x64-Setup.exe -R anhyeuviolet/BingWallpaperUpdater`) chỉ được tạo cho các thẻ dựng khi kho mã đang công khai. Kho mã còn ở chế độ riêng tư khi bản phát hành đầu tiên được dựng, nên bản đó không có chứng thực; các bản sau sẽ có khi kho mã đã công khai.
+Mỗi bản phát hành còn kèm chứng thực nguồn gốc bản dựng của GitHub, chứng minh tệp do workflow của chính kho mã này tạo ra:
+
+```powershell
+gh attestation verify BingWallpaperUpdater-<version>-x64-Setup.exe -R anhyeuviolet/BingWallpaperUpdater
+```
 
 ## Ứng dụng đụng vào những gì
 
