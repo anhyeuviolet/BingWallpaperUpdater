@@ -17,6 +17,13 @@ namespace BingWallpaperUpdater.App;
 /// <see cref="TableLayoutPanel"/>s with AutoSize columns and rows, AutoSize labels, ComboBox widths measured from
 /// their items at the current DPI, wrapping labels bounded by <see cref="Control.LogicalToDeviceUnits(int)"/>, and no
 /// numeric Size / Width / ClientSize / Font assignment anywhere — the exact thing that clips Vietnamese at 150 %.
+/// The current-image title and copyright rows are the one exception to "everything AutoSize": they are fixed boxes
+/// (the wrap width by two text lines, measured from the live font at the current DPI in <see cref="FixedValueSize"/>,
+/// <see cref="Label.AutoEllipsis"/> for overflow with the label's built-in full-text tooltip) so the table's preferred
+/// size — and with it the form's client size — never follows the text (UI-04, Phase 04 deferred item 2: an AutoSize
+/// label made every tick that landed on a longer or shorter description re-lay out and visibly resize the window).
+/// The form keeps <see cref="AutoSizeMode.GrowAndShrink"/>: with a text-independent table its preferred size is
+/// constant, and GrowOnly would pin a 150 % size after a move to a 100 % monitor.
 /// Every control applies on change (UI-03): the handler mutates the shared <see cref="Settings"/> instance, saves
 /// <c>settings.json</c> atomically and calls <see cref="RotationService.ApplySettings"/> through <see cref="Commit"/>;
 /// there is no Save button. The current-image / times / last-error panel (UI-04) is a static rendering of
@@ -43,6 +50,7 @@ internal sealed class SettingsForm : Form
     private readonly TableLayoutPanel _table;
     private readonly List<ComboBox> _combos = [];
     private readonly List<Label> _wrapping = [];
+    private readonly List<(Label Label, int Lines)> _fixed = [];
     private readonly ComboBox _interval;
     private readonly ComboBox _mode;
     private readonly ComboBox _resolution;
@@ -166,8 +174,10 @@ internal sealed class SettingsForm : Form
         TableLayoutPanel current = NewTable();
         current.Dock = DockStyle.Fill;
         group.Controls.Add(current);
-        AddRow(current, "Label_Title", _title = ValueLabel(wrap: true));
-        AddRow(current, "Label_Copyright", _copyright = ValueLabel(wrap: true));
+        // Fixed two-line boxes (not AutoSize): a one-line title leaves its second line blank, a longer one wraps,
+        // ends with an ellipsis and shows the full text as a tooltip — the window never resizes with the text.
+        AddRow(current, "Label_Title", _title = FixedValueLabel("TitleValue", lines: 2));
+        AddRow(current, "Label_Copyright", _copyright = FixedValueLabel("CopyrightValue", lines: 2));
         AddRow(current, "Label_Date", _date = ValueLabel(wrap: false));
         AddRow(_table, null, group);
 
@@ -218,6 +228,7 @@ internal sealed class SettingsForm : Form
         base.OnLoad(e);
         _rotation.StateChanged += _onStateChanged;
         RefreshStatus();
+        LogLayout();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -226,13 +237,20 @@ internal sealed class SettingsForm : Form
         base.OnFormClosed(e);
     }
 
-    /// <summary>PerMonitorV2: the form moved to a monitor with another DPI — re-measure every ComboBox and wrap bound at the new font/DPI.</summary>
+    /// <summary>PerMonitorV2: the form moved to a monitor with another DPI — re-measure every ComboBox, wrap bound and fixed box at the new font/DPI.</summary>
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
         foreach (Label l in _wrapping)
         {
             l.MaximumSize = new Size(LogicalToDeviceUnits(WrapLogicalWidth), 0);
+        }
+
+        // WinForms has already rescaled Font and DeviceDpi inside base.OnDpiChanged, so the boxes are re-measured
+        // at the new DPI; without this they would keep the old DPI's pixel size and clip to fewer lines.
+        foreach ((Label l, int lines) in _fixed)
+        {
+            l.Size = FixedValueSize(l, lines);
         }
 
         foreach (ComboBox c in _combos)
@@ -242,6 +260,14 @@ internal sealed class SettingsForm : Form
                 c.Width = WidestItemWidth(c);
             }
         }
+
+        LogLayout();
+    }
+
+    /// <summary>One line per window open (and per DPI change) so the geometry is verifiable from log.txt without a screenshot.</summary>
+    private void LogLayout()
+    {
+        Log.Info($"settings window layout dpi={DeviceDpi} client={ClientSize.Width}x{ClientSize.Height} title={_title.Width}x{_title.Height} copyright={_copyright.Width}x{_copyright.Height}");
     }
 
     /// <summary>Arrives on a thread-pool thread (after a tick or ApplySettings); hop to the UI thread if the window is still alive.</summary>
@@ -482,6 +508,48 @@ internal sealed class SettingsForm : Form
         }
 
         return l;
+    }
+
+    /// <summary>
+    /// A read-only value label with a fixed box (not AutoSize): the wrap width by <paramref name="lines"/> text lines,
+    /// measured by <see cref="FixedValueSize"/> from the live font at the current DPI and re-measured in
+    /// <see cref="OnDpiChanged"/>. <see cref="Label.AutoEllipsis"/> word-wraps inside the box, ends a longer text with
+    /// an ellipsis and shows the full text in the label's own internal ToolTip on hover (created and disposed with the
+    /// label, so no extra component and nothing new for the per-open GDI count). The box contributes its
+    /// <see cref="Control.Size"/> — not the text's preferred size — to the <see cref="TableLayoutPanel"/> measurement,
+    /// which is what keeps the client size independent of the text.
+    /// </summary>
+    private Label FixedValueLabel(string name, int lines)
+    {
+        var l = new Label
+        {
+            Name = name,   // UI Automation id
+            AutoSize = false,
+            AutoEllipsis = true,
+            UseMnemonic = false,   // metadata may contain '&'
+            Anchor = AnchorStyles.Left | AnchorStyles.Right,
+            Margin = new Padding(0, 6, 0, 6),
+        };
+        l.Size = FixedValueSize(l, lines);
+        _fixed.Add((l, lines));
+        return l;
+    }
+
+    /// <summary>
+    /// The device-unit box for exactly <paramref name="lines"/> fully visible text lines at the label's current font
+    /// and DPI: width = the logical wrap width in device units, height = the measured height of a
+    /// <paramref name="lines"/>-line sample ("Wg" per line) with the same flags the <see cref="Label"/> paints with
+    /// (<see cref="TextFormatFlags.WordBreak"/> | <see cref="TextFormatFlags.TextBoxControl"/>, plus EndEllipsis for
+    /// AutoEllipsis). TextBoxControl hides a partially visible last line, so measuring the sample with it yields
+    /// exactly N whole lines. No numeric literal enters a <see cref="Size"/> and <see cref="Control.Font"/> is never
+    /// assigned (Pattern 4); the height is never derived from Font.Height arithmetic.
+    /// </summary>
+    private Size FixedValueSize(Label l, int lines)
+    {
+        int width = LogicalToDeviceUnits(WrapLogicalWidth);
+        string sample = string.Join("\n", Enumerable.Repeat("Wg", lines));
+        int height = TextRenderer.MeasureText(sample, l.Font, new Size(width, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl).Height;
+        return new Size(width, height);
     }
 
     /// <summary>
