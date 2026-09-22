@@ -91,6 +91,7 @@ internal sealed class SettingsForm : Form
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.CenterScreen;
         Padding = new Padding(12);                        // logical px; scaled by AutoScale
+        BackColor = OwnedCopy(SystemColors.Control);      // dark-mode brush ownership, see OwnedCopy
 
         _table = NewTable();
         _table.Dock = DockStyle.Fill;
@@ -471,6 +472,19 @@ internal sealed class SettingsForm : Form
 
     // ---- layout helpers (Pattern 4: every size derives from content) -----------------------------------------
 
+    /// <summary>
+    /// The same ARGB as <paramref name="systemColor"/> (resolved for the current light or dark color set) as a
+    /// non-system <see cref="Color"/>, so WinForms creates the control's WM_CTLCOLOR brush itself and deletes it on
+    /// dispose. With <see cref="Application.SetColorMode"/> in dark mode, .NET 10's <c>Control.BackColorBrush</c> asks
+    /// <c>GetSysColorBrush</c> for a system color and gets a freshly created solid brush (the alternative color set has
+    /// no real system brushes) but records it as system-owned, so it is never <c>DeleteObject</c>'ed: one HBRUSH leaks
+    /// per native-drawn control per open — each DropDownList <see cref="ComboBox"/> (its own Window brush) and the
+    /// form's Control brush that the native dark-mode <see cref="Button"/>s share through the parent chain — the ~7
+    /// GDI objects per Settings cycle in <c>docs/soak/win11-soak.csv</c>. A non-system color takes the
+    /// <c>CreateSolidBrush</c> + owned branch instead; pixels are identical in both modes, only ownership changes.
+    /// </summary>
+    private static Color OwnedCopy(Color systemColor) => Color.FromArgb(systemColor.ToArgb());
+
     private static TableLayoutPanel NewTable()
     {
         var t = new TableLayoutPanel
@@ -582,6 +596,7 @@ internal sealed class SettingsForm : Form
             DropDownStyle = ComboBoxStyle.DropDownList,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 0, 3),
+            BackColor = OwnedCopy(SystemColors.Window),   // dark-mode brush ownership, see OwnedCopy
         };
         foreach (Item it in items)
         {
