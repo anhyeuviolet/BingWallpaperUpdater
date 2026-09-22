@@ -674,9 +674,10 @@ public sealed class RotationService : IDisposable
             }
 
             // 4b. backfill (CACHE-06) — after the apply, never before it; only on a tick whose fetch and newest ensure
-            // both succeeded (never offline, never after a throw); at most one download. Its own try/catch inside
-            // BackfillOneAsync keeps a backfill failure out of the ladder, the schedule and the tick result.
-            if (!fetchFailed && !threw)
+            // both succeeded (never offline); at most one download. A throw anywhere above skips this line entirely
+            // (it lands in the catch below), so `threw` needs no test here. Its own try/catch inside BackfillOneAsync
+            // keeps a backfill failure out of the ladder, the schedule and the tick result.
+            if (!fetchFailed)
             {
                 await BackfillOneAsync(rows, resolution, ct).ConfigureAwait(false);
             }
