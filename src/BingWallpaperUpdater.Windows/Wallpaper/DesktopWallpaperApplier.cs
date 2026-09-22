@@ -13,7 +13,9 @@ namespace BingWallpaperUpdater.Windows.Wallpaper;
 /// <summary>
 /// Applies a wallpaper through <c>IDesktopWallpaper</c> (Windows 8+): <c>SetPosition(DWPOS_FILL)</c> first,
 /// then <c>SetWallpaper(NULL, path)</c> — a NULL monitor ID means every monitor (WALL-02). The result is read
-/// back with <c>GetWallpaper(NULL)</c>/<c>GetPosition</c> and a mismatch is logged, never thrown (PITFALLS P4).
+/// back with <c>GetWallpaper(NULL)</c>/<c>GetPosition</c>; a mismatch is logged, never thrown (PITFALLS P4), and a
+/// read-back that itself fails after a successful set is logged and reported as Ok with an unknown read-back, never
+/// as a failed apply (IN-14) — only <c>SetPosition</c>/<c>SetWallpaper</c> decide <see cref="ApplyResult.Ok"/>.
 /// Call on the WinForms UI thread; one COM proxy is created per operation and released deterministically in a
 /// <c>finally</c> on the same STA thread (<see cref="Activate"/> / <see cref="Release"/>, WR-02) — never left to the
 /// MTA finalizer thread, and never through <c>Marshal.ReleaseComObject</c>, which rejects source-generated RCWs.
@@ -58,28 +60,44 @@ public sealed unsafe partial class DesktopWallpaperApplier : IWallpaperApplier
 
         try
         {
-            wallpaper.SetPosition(DESKTOP_WALLPAPER_POSITION.DWPOS_FILL);
-            fixed (char* p = absolutePath)
+            try
             {
-                wallpaper.SetWallpaper(default, new PCWSTR(p));
+                wallpaper.SetPosition(DESKTOP_WALLPAPER_POSITION.DWPOS_FILL);
+                fixed (char* p = absolutePath)
+                {
+                    wallpaper.SetWallpaper(default, new PCWSTR(p));
+                }
+            }
+            catch (Exception ex) when (ComFailure.IsCallFailure(ex))
+            {
+                // SetPosition / SetWallpaper failed after a good activation: E_INVALIDARG surfaces as
+                // ArgumentException and E_ACCESSDENIED as UnauthorizedAccessException, not only as COMException.
+                return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
             }
 
-            string? readBack = ReadBack(wallpaper, default);
-            DESKTOP_WALLPAPER_POSITION position;
-            wallpaper.GetPosition(&position);
-
-            if (readBack is null || !string.Equals(readBack, absolutePath, StringComparison.OrdinalIgnoreCase))
+            // The desktop has changed: from here on the apply is Ok whatever the read-back does. A read-back throw
+            // is logged and reported as an unknown read-back (null), never as a failed apply — otherwise the pipeline
+            // would record the previous image while the shell already shows the new one (IN-14).
+            string? readBack = null;
+            string? position = null;
+            try
             {
-                Log.Warn($"apply readback-mismatch expected={absolutePath} actual={readBack ?? "-"}");
+                readBack = ReadBack(wallpaper, default);
+                DESKTOP_WALLPAPER_POSITION pos;
+                wallpaper.GetPosition(&pos);
+                position = pos.ToString();
+
+                if (readBack is null || !string.Equals(readBack, absolutePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Warn($"apply readback-mismatch expected={absolutePath} actual={readBack ?? "-"}");
+                }
+            }
+            catch (Exception ex) when (ComFailure.IsCallFailure(ex))
+            {
+                Log.Warn($"apply readback-failed expected={absolutePath} error={ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
             }
 
-            return new ApplyResult(true, MethodName, readBack, position.ToString(), null);
-        }
-        catch (Exception ex) when (ComFailure.IsCallFailure(ex))
-        {
-            // SetPosition / SetWallpaper / GetWallpaper failed after a good activation: E_INVALIDARG surfaces as
-            // ArgumentException and E_ACCESSDENIED as UnauthorizedAccessException, not only as COMException.
-            return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
+            return new ApplyResult(true, MethodName, readBack, position, null);
         }
         finally
         {
@@ -175,45 +193,59 @@ public sealed unsafe partial class DesktopWallpaperApplier : IWallpaperApplier
 
         try
         {
-            wallpaper.SetPosition(DESKTOP_WALLPAPER_POSITION.DWPOS_FILL);
-            foreach ((MonitorHandle monitor, string absolutePath) in assignments)
+            try
             {
-                fixed (char* m = monitor.DevicePath)
-                fixed (char* p = absolutePath)
+                wallpaper.SetPosition(DESKTOP_WALLPAPER_POSITION.DWPOS_FILL);
+                foreach ((MonitorHandle monitor, string absolutePath) in assignments)
                 {
-                    wallpaper.SetWallpaper(new PCWSTR(m), new PCWSTR(p));
+                    fixed (char* m = monitor.DevicePath)
+                    fixed (char* p = absolutePath)
+                    {
+                        wallpaper.SetWallpaper(new PCWSTR(m), new PCWSTR(p));
+                    }
                 }
             }
+            catch (Exception ex) when (ComFailure.IsCallFailure(ex))
+            {
+                return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
+            }
 
-            // Read back PER monitor — never GetWallpaper(NULL) here: it answers "" as soon as monitors differ.
+            // Every monitor is set: the apply is Ok whatever the read-back does (IN-14, see Apply). Read back PER
+            // monitor — never GetWallpaper(NULL) here: it answers "" as soon as monitors differ.
             string? primaryReadBack = null;
-            for (int i = 0; i < assignments.Count; i++)
+            string? position = null;
+            try
             {
-                (MonitorHandle monitor, string absolutePath) = assignments[i];
-                string? readBack;
-                fixed (char* m = monitor.DevicePath)
+                for (int i = 0; i < assignments.Count; i++)
                 {
-                    readBack = ReadBack(wallpaper, new PCWSTR(m));
+                    (MonitorHandle monitor, string absolutePath) = assignments[i];
+                    string? readBack;
+                    fixed (char* m = monitor.DevicePath)
+                    {
+                        readBack = ReadBack(wallpaper, new PCWSTR(m));
+                    }
+
+                    if (i == 0)
+                    {
+                        primaryReadBack = readBack;
+                    }
+
+                    if (readBack is null || !string.Equals(readBack, absolutePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log.Warn($"apply readback-mismatch monitor={i} expected={absolutePath} actual={readBack ?? "-"}");
+                    }
                 }
 
-                if (i == 0)
-                {
-                    primaryReadBack = readBack;
-                }
-
-                if (readBack is null || !string.Equals(readBack, absolutePath, StringComparison.OrdinalIgnoreCase))
-                {
-                    Log.Warn($"apply readback-mismatch monitor={i} expected={absolutePath} actual={readBack ?? "-"}");
-                }
+                DESKTOP_WALLPAPER_POSITION pos;
+                wallpaper.GetPosition(&pos);
+                position = pos.ToString();
+            }
+            catch (Exception ex) when (ComFailure.IsCallFailure(ex))
+            {
+                Log.Warn($"apply readback-failed monitors={assignments.Count} error={ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
             }
 
-            DESKTOP_WALLPAPER_POSITION position;
-            wallpaper.GetPosition(&position);
-            return new ApplyResult(true, MethodName, primaryReadBack, position.ToString(), null);
-        }
-        catch (Exception ex) when (ComFailure.IsCallFailure(ex))
-        {
-            return new ApplyResult(false, MethodName, null, null, $"{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
+            return new ApplyResult(true, MethodName, primaryReadBack, position, null);
         }
         finally
         {
