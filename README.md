@@ -102,7 +102,7 @@ Measured with [`tools/soak.ps1`](tools/soak.ps1) on the published build, startin
 
 "Private WS" is what Task Manager's Memory column shows and what the under-100 MB promise is about: pages only this process uses. The total working set is larger because it includes about 50 MB of shared, file-backed .NET runtime pages that every .NET process maps and Windows counts once. The peak (30.6 MB) is with the Settings window open; with it closed the app sits at 19-26 MB.
 
-Known issue: the run ends with `SOAK WARN reason=gdi growth`: each Settings window open/close adds about 7 GDI objects (14 -> 160 over 20 cycles; flat across the 200 ticks); private working set, handles and USER objects do not grow. This is tracked for a fix in Phase 4 gap closure (per-process GDI limit 10,000).
+Note on the committed run: it ends with `SOAK WARN reason=gdi growth` because, on that build, each Settings window open/close leaked about 7 GDI brushes in dark mode (14 -> 160 over 20 cycles; a WinForms .NET 10 dark-mode brush-ownership bug). This is fixed in commit `376652c` (the window and its drop-downs now own their background brushes); a re-run of `tools/soak.ps1 -Ticks 0 -SettingsCycles 20` on the fixed build reports `SOAK OK ... gdi=33->33`. Private working set, handles and USER objects never grew.
 
 Evidence: [`docs/soak/win11-soak.csv`](docs/soak/win11-soak.csv) and [`docs/soak/win11-soak.csv.result.txt`](docs/soak/win11-soak.csv.result.txt). The Windows 10 1809 row will be filled in the same way once such a machine is available.
 

@@ -102,7 +102,7 @@ Settings > Apps > Installed apps > **Bing Wallpaper Updater** > Uninstall (hoặ
 
 "Private WS" là con số cột Memory trong Task Manager và là điều mà lời hứa dưới 100 MB nói tới: các trang bộ nhớ chỉ tiến trình này dùng. Working set tổng lớn hơn vì gồm khoảng 50 MB trang .NET runtime dùng chung, ánh xạ từ tệp, mà mọi tiến trình .NET đều nạp và Windows chỉ đếm một lần. Đỉnh (30.6 MB) là lúc cửa sổ Cài đặt đang mở; khi đóng cửa sổ, ứng dụng ở mức 19-26 MB.
 
-Lỗi đã biết: lượt đo kết thúc với `SOAK WARN reason=gdi growth`: mỗi lần mở/đóng cửa sổ Cài đặt thêm khoảng 7 đối tượng GDI (14 -> 160 sau 20 lần; giữ nguyên suốt 200 lần đổi ảnh); private working set, số handle và đối tượng USER không tăng. Vấn đề này đang được theo dõi để sửa trong đợt vá Phase 4 (giới hạn GDI mỗi tiến trình là 10.000).
+Ghi chú về lượt đo đã lưu: nó kết thúc với `SOAK WARN reason=gdi growth` vì trên bản build đó, mỗi lần mở/đóng cửa sổ Cài đặt rò khoảng 7 brush GDI ở chế độ tối (14 -> 160 sau 20 lần; lỗi quyền sở hữu brush của WinForms .NET 10 ở chế độ tối). Lỗi này đã được sửa ở commit `376652c` (cửa sổ và các hộp chọn tự sở hữu brush nền); chạy lại `tools/soak.ps1 -Ticks 0 -SettingsCycles 20` trên bản đã sửa cho `SOAK OK ... gdi=33->33`. Private working set, số handle và đối tượng USER chưa bao giờ tăng.
 
 Bằng chứng: [`docs/soak/win11-soak.csv`](docs/soak/win11-soak.csv) và [`docs/soak/win11-soak.csv.result.txt`](docs/soak/win11-soak.csv.result.txt). Dòng Windows 10 1809 sẽ được điền theo đúng cách này khi có máy để đo.
 
