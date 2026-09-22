@@ -1,0 +1,1 @@
+SOAK WARN privateWS=30.6MB closed=18.9->26.1MB ws=106.5MB commit=36.4MB slope=-6.72KB/tick handles=634->653 gdi=61->167 user=27->30 ticks=200 cycles=20 duration=6.4min samples=27 reason=gdi growth
