@@ -109,6 +109,30 @@ public sealed class RotationServiceTests : IDisposable
     }
 
     /// <summary>
+    /// The same routes as <see cref="Routes(string?)"/>, except that a download whose query names <paramref name="deadId"/>
+    /// answers the CDN's 404-as-jpeg placeholder (status 404, <c>image/jpeg</c>, a bare FF D8 body) on both Bing hosts;
+    /// every other image request falls through to the normal JPEG. One catalog ID that can never be cached (CACHE-06).
+    /// </summary>
+    private static FakeHttpHandler RoutesWithDeadImage(string deadId)
+    {
+        string body = Fixture("README.sample.md");
+        string archive = Fixture("hpimagearchive.sample.json");
+        var fake = new FakeHttpHandler();
+        fake.Map(GitHubHost, "/", req => req.Headers.IfNoneMatch.Count > 0
+            ? FakeHttpHandler.Text(304, string.Empty, Etag)
+            : FakeHttpHandler.Text(200, body, Etag));
+        foreach (string host in new[] { BingImageUrl.PrimaryHost, BingImageUrl.RetryHost })
+        {
+            fake.Map(host, ArchivePath, _ => FakeHttpHandler.Json(200, archive));
+            fake.Map(host, ImagePath, req => req.RequestUri!.Query.Contains(deadId, StringComparison.Ordinal)
+                ? FakeHttpHandler.Bytes(404, "image/jpeg", new byte[] { 0xFF, 0xD8 })
+                : FakeHttpHandler.Bytes(200, "image/jpeg", JpegBytes.Sof0(3840, 2160)));
+        }
+
+        return fake;
+    }
+
+    /// <summary>
     /// Mutable catalog sources for <see cref="Routes(Catalog)"/>: swap <see cref="Body"/> mid-test to make the README
     /// move, flip <see cref="GitHubOnline"/> to take GitHub away, swap <see cref="Archive"/> to move HPImageArchive.
     /// </summary>
@@ -2486,5 +2510,190 @@ public sealed class RotationServiceTests : IDisposable
         string backfillLine = log.Split('\n').Single(l => l.Contains("backfill id=", StringComparison.Ordinal)).TrimEnd('\r');
         Assert.EndsWith("cached=2/10", backfillLine, StringComparison.Ordinal);
         Assert.Contains($"backfill id={SecondId} file=", backfillLine, StringComparison.Ordinal);
+    }
+
+    /// <summary>ROADMAP success criterion 6: ten successful ticks from an empty cache reach ten distinct catalog IDs, one backfill per tick, then the cap holds.</summary>
+    [Fact]
+    public async Task Backfill_TenTicks_EmptyCache_ReachesTenDistinctIds_ThenSkipsFull()
+    {
+        IReadOnlyList<(string Date, string Id)> rows = ReadmeRows();
+        Assert.Equal(SecondId, rows[1].Id);   // the constants name README.sample.md rows 2 and 3
+        Assert.Equal(ThirdId, rows[2].Id);
+
+        Harness h = Build(Newest(), new AppState());
+        await StartAsync(h);
+        Assert.Equal(2, h.Cache.Index.Images.Count);
+
+        int intervalTicks = 0;
+        while (h.Cache.Index.Images.Count < ImageCache.MaxImages && intervalTicks < 20)
+        {
+            await AdvanceAsync(h, Interval);
+            intervalTicks++;
+            Assert.Equal(2 + intervalTicks, h.Cache.Index.Images.Count);   // exactly one backfill per successful tick
+        }
+
+        Assert.Equal(8, intervalTicks);                                    // Startup + 8 Interval ticks = 10 images
+        Assert.Equal(10, h.Cache.Index.Images.Count);
+        string[] ids = h.Cache.Index.Images.Select(i => i.Id).ToArray();
+        Assert.Equal(10, ids.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(rows.Take(10).Select(r => r.Id), ids);                // the newest plus the nine next older days
+        Assert.Equal(10, ImageDownloads(h));                               // 1 newest + 9 backfills
+        Assert.Equal(9, LogCount("backfill id="));
+        Assert.Equal(0, LogCount("backfill skipped"));
+        Assert.Equal(1, h.Applier.Calls);                                  // only the newest was ever applied
+
+        await AdvanceAsync(h, Interval);                                   // one more: the cap holds
+
+        Assert.Equal(1, LogCount("backfill skipped cause=full"));
+        Assert.Equal(10, ImageDownloads(h));
+        Assert.Equal(10, h.Cache.Index.Images.Count);
+        Assert.Equal(9, LogCount("backfill id="));
+    }
+
+    [Fact]
+    public async Task Backfill_CacheAtCap_LogsFull_NoDownload()
+    {
+        IReadOnlyList<(string Date, string Id)> rows = ReadmeRows();
+        CachedImage[] ten = rows.Take(ImageCache.MaxImages).Select((r, i) => Cached(r.Id, r.Date, 100 - i * 10)).ToArray();
+        ImageCache cache = SeedCache(ten, applied: NewestId);
+        var state = new AppState { CurrentImageId = NewestId, LastSeenNewestId = NewestId, NextDueUtc = T0.AddMinutes(20) };
+        Harness h = Build(Newest(), state, cache);
+
+        await StartAsync(h);
+
+        Assert.Equal(0, ImageDownloads(h));
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Equal(1, LogCount("backfill skipped cause=full"));
+        Assert.Equal(0, LogCount("backfill id="));
+        Assert.Equal(10, h.Cache.Index.Images.Count);
+        Assert.Contains("tick done reason=Startup result=NoOp", LogText());
+    }
+
+    [Fact]
+    public async Task Backfill_AllCatalogRowsCached_LogsNoCandidate()
+    {
+        Harness h = Build(Newest(), new AppState(), fake: Routes(ReadmeWithRows(2)));
+
+        await StartAsync(h);
+        Assert.Equal(2, h.Cache.Index.Images.Count);
+        Assert.Equal(2, ImageDownloads(h));
+        Assert.Equal(1, LogCount("backfill id="));
+
+        await AdvanceAsync(h, Interval);
+
+        Assert.Equal(1, LogCount("backfill skipped cause=no-candidate"));
+        Assert.Equal(2, ImageDownloads(h));
+        Assert.Equal(2, h.Cache.Index.Images.Count);
+        Assert.Equal(1, LogCount("backfill id="));
+        Assert.Contains("tick done reason=Interval result=NoOp decision=NoOp why=unchanged", LogText());
+    }
+
+    [Fact]
+    public async Task Backfill_OfflineTick_DownloadsNothing_LeavesLadderAlone()
+    {
+        Harness h = Build(Newest(), new AppState(), fake: Offline());
+
+        await StartAsync(h);
+
+        Assert.Equal(0, ImageDownloads(h));
+        Assert.DoesNotContain("backfill", LogText(), StringComparison.Ordinal);
+        Assert.Equal(0, h.Applier.Calls);
+        Assert.Empty(h.Cache.Index.Images);
+        Assert.Equal(1, h.Service.FailureStage);                           // the pre-existing D-13 ladder, untouched
+        Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Contains("tick done reason=Startup result=FetchFailed", LogText());
+        AssertStateFileHasNoRetry();
+    }
+
+    [Fact]
+    public async Task Backfill_DeadCatalogId_IsSkippedForTheProcess()
+    {
+        Harness h = Build(Newest(), new AppState(), fake: RoutesWithDeadImage(SecondId));
+        int DeadRequests() => h.Http.Requests.Count(r => r.Uri.Query.Contains(SecondId, StringComparison.Ordinal));
+
+        await StartAsync(h);
+
+        Assert.Equal(1, LogCount($"backfill failed id={SecondId}"));
+        Assert.Equal(0, LogCount("backfill id="));
+        Assert.Equal(new[] { NewestId }, h.Cache.Index.Images.Select(i => i.Id));   // only the newest was cached
+        Assert.Equal(1, DeadRequests());
+        Assert.Equal(2, ImageDownloads(h));                                // newest + the rejected attempt
+
+        await AdvanceAsync(h, Interval);                                   // the dead ID is not asked for again
+
+        Assert.Equal(1, DeadRequests());
+        Assert.Equal(1, LogCount($"backfill id={ThirdId} "));
+        Assert.Equal(new[] { NewestId, ThirdId }, h.Cache.Index.Images.Select(i => i.Id));
+        Assert.Equal(3, ImageDownloads(h));
+        Assert.Equal(1, LogCount("backfill failed id="));
+    }
+
+    [Fact]
+    public async Task Backfill_Failure_NeverTouchesTickResultOrLadder()
+    {
+        Harness h = Build(Newest(), new AppState(), fake: RoutesWithDeadImage(SecondId));
+
+        await StartAsync(h);
+
+        Assert.Equal(1, LogCount($"backfill failed id={SecondId}"));
+        Assert.Contains("tick done reason=Startup result=Applied decision=ApplyNew why=new", LogText());
+        Assert.DoesNotContain("tick failed", LogText(), StringComparison.Ordinal);
+        Assert.DoesNotContain("retry scheduled", LogText(), StringComparison.Ordinal);
+        Assert.Equal(0, h.Service.FailureStage);
+        Assert.Null(h.Service.RetryDueUtc);
+        Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Equal(1, h.Applier.Calls);
+
+        // The saved state is the no-backfill contract of StartupTick_NewCatalogId_AppliesWithinOneTick_SetsLastSeenAndNextDue.
+        AppState? saved = SavedState();
+        Assert.NotNull(saved);
+        Assert.Equal(NewestId, saved!.LastSeenNewestId);
+        Assert.Equal(NewestId, saved.CurrentImageId);
+        Assert.Equal(T0 + Interval, saved.NextDueUtc);
+        Assert.Equal(T0, saved.LastCheckUtc);
+        Assert.Equal(T0, saved.LastAppliedUtc);
+        AssertStateFileHasNoRetry();
+    }
+
+    [Fact]
+    public async Task Backfill_UsesTickResolution()
+    {
+        Settings settings = Newest();
+        settings.Resolution = "1920x1080";
+        Harness h = Build(settings, new AppState());
+
+        await StartAsync(h);
+
+        List<RecordedRequest> images = ImageRequests(h);
+        Assert.Equal(2, images.Count);
+        Assert.All(images, image => Assert.Contains("w=1920&h=1080", image.Uri.Query, StringComparison.Ordinal));
+        CachedImage backfilled = Assert.Single(h.Cache.Index.Images, i => string.Equals(i.Id, SecondId, StringComparison.Ordinal));
+        Assert.Equal("1920x1080", backfilled.Resolution);
+        Assert.EndsWith(".1920x1080.jpg", backfilled.File, StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(_dir, backfilled.File)));
+        Assert.Contains($"backfill id={SecondId} file={backfilled.File} cached=2/10", LogText(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Backfill_LogOrder_ApplyThenBackfillThenTickDone()
+    {
+        Harness h = Build(Newest(), new AppState());
+        await StartAsync(h);
+        Assert.Equal(1, LogCount("apply ok"));
+
+        await AdvanceAsync(h, Interval);                                   // unchanged catalog: NoOp, still backfills
+
+        string log = LogText();
+        int tickAt = log.IndexOf("tick reason=Interval", StringComparison.Ordinal);
+        Assert.True(tickAt >= 0, "no Interval tick logged");
+        string interval = log[tickAt..];
+        Assert.DoesNotContain("apply ok", interval, StringComparison.Ordinal);
+        int backfillAt = interval.IndexOf("backfill id=", StringComparison.Ordinal);
+        int doneAt = interval.IndexOf("tick done reason=Interval", StringComparison.Ordinal);
+        Assert.True(backfillAt > 0 && doneAt > backfillAt, $"expected tick reason=Interval < backfill id= < tick done reason=Interval, got 0/{backfillAt}/{doneAt}");
+        Assert.Contains("tick done reason=Interval result=NoOp decision=NoOp why=unchanged", interval, StringComparison.Ordinal);
+        Assert.Equal(2, LogCount("backfill id="));
+        Assert.Equal(3, h.Cache.Index.Images.Count);
     }
 }
