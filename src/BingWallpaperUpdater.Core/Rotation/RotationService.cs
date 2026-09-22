@@ -249,7 +249,10 @@ public sealed class RotationService : IDisposable
     /// attached set itself, so it is <c>cause=unchanged</c> when the holder's apply already covered the new monitors.
     /// A pending mode switch wins: the forced re-apply applies over the monitors attached now and commits that set,
     /// so the display flag needs no separate dispatch. Ticks are never deferred (D-01), and a re-apply that owns the
-    /// gate clears its own flag, so a failed or no-current re-apply can never re-dispatch (T-03-22).
+    /// gate clears its own flag, so a failed or no-current re-apply never re-dispatches itself (T-03-22). The
+    /// bound, not an absolute: with a real (asynchronous) dispatcher a forced call whose <c>Wait(0)</c> beats the
+    /// follow-up this method dispatched can see that follow-up's flag in its own finally and run at most one more
+    /// bounded attempt (IN-11) — that attempt clears its flag and nothing re-sets it, so there is never a loop.
     /// </summary>
     private void ReapplyIfPending()
     {
@@ -832,7 +835,9 @@ public sealed class RotationService : IDisposable
     /// Returns true only when an apply ran and reported Ok — and only then is the monitor mode it applied in committed
     /// to <c>_appliedMonitorMode</c> (WR-01). Either kind marks itself pending before its gate attempt: when the
     /// gate is busy the holder's finally runs it after its release (<see cref="ReapplyIfPending"/>, WR-01 / WR-05);
-    /// when this call owns the gate it clears its flag, so its own failure never dispatches another attempt (T-03-22).
+    /// when this call owns the gate it clears its flag, so its own failure does not re-dispatch itself (T-03-22). A
+    /// concurrent forced call can still have re-set the flag in between, in which case the finally runs at most one
+    /// bounded follow-up — never a loop (IN-11).
     /// </summary>
     private async Task<bool> RunReapplyAsync(string reason, bool force)
     {
@@ -872,7 +877,8 @@ public sealed class RotationService : IDisposable
         {
             lock (_sync)
             {
-                // This call IS the follow-up for its reason; nothing else may dispatch another one for it.
+                // This call IS the follow-up for its reason: its own failure will not re-dispatch it. (A concurrent
+                // forced call may re-set the flag after this point — at most one bounded extra attempt, IN-11.)
                 if (force)
                 {
                     _modeReapplyPending = false;
