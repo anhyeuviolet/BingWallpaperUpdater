@@ -769,9 +769,11 @@ public sealed class RotationService : IDisposable
     /// download exactly one older catalog image so that "Next" and random mode have material within days of install.
     /// Runs only from a successful tick — one whose fetch produced rows and whose newest ensure did not fail — and
     /// always after the apply, so the newest-image step is never delayed or replaced. The candidate is the newest row
-    /// (rows are newest first) that is neither cached with its file on disk for this tick's resolution nor in the
-    /// process-local <see cref="_backfillSkip"/> set; a rejected download retires its ID for the rest of the process
-    /// (a restart retries once) so one dead catalog ID never costs a request on every tick. <paramref name="resolution"/>
+    /// (rows are newest first) whose ID is cached at no resolution at all, falling back to the newest row that is not
+    /// cached with its file on disk for this tick's resolution (so a resolution change does not spend the cap on the
+    /// same days twice, IN-03); rows in the process-local <see cref="_backfillSkip"/> set are never candidates, and
+    /// a rejected download retires its ID for the rest of the process (a restart retries once) so one dead catalog ID
+    /// never costs a request on every tick. <paramref name="resolution"/>
     /// is the tick-local effective resolution (Auto never reaches here), so the backfill goes through the same
     /// <see cref="ImageCache.EnsureAsync"/> pipeline as the newest image: host allow-list, JPEG validation, dimension
     /// check and the 64 MB cap are unchanged. The cap check precedes any download because <see cref="ImageCache.Add"/>
@@ -788,9 +790,19 @@ public sealed class RotationService : IDisposable
                 return;
             }
 
-            CatalogEntry? candidate = rows.FirstOrDefault(r =>
+            // Two passes, both newest first (IN-03): cache identity is (id, resolution) and the cap counts entries,
+            // so after a resolution change the plain "not cached at this resolution" rule would re-download the
+            // days already held at the old resolution and fill the cap with two variants of the same five days.
+            // Pass 1 therefore prefers IDs absent at every resolution (new days for the cache); pass 2 is the
+            // original rule, reached only once every catalog row is held at some resolution.
+            bool NotCachedHere(CatalogEntry r) =>
                 !_backfillSkip.Contains(r.Id.Value)
-                && (_cache.TryGet(r.Id, resolution) is not { } hit || !FileExists(hit)));
+                && (_cache.TryGet(r.Id, resolution) is not { } hit || !FileExists(hit));
+            bool CachedAnywhere(CatalogEntry r) =>
+                _cache.Index.Images.Any(i => string.Equals(i.Id, r.Id.Value, StringComparison.Ordinal) && FileExists(i));
+
+            CatalogEntry? candidate = rows.FirstOrDefault(r => NotCachedHere(r) && !CachedAnywhere(r))
+                ?? rows.FirstOrDefault(NotCachedHere);
             if (candidate is null)
             {
                 Log.Info("backfill skipped cause=no-candidate");

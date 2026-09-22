@@ -2679,6 +2679,68 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Contains($"backfill id={SecondId} file={backfilled.File} cached=2/10", LogText(), StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// IN-03: five days cached at UHD, the user switches to 1920x1080. The decider keeps the UHD current image (one
+    /// candidate per ID, any resolution), so the only download is the backfill — and it must not re-fetch days 1-5 as
+    /// 1080 twins: it prefers the first catalog row absent at every resolution, so the cap fills with new days.
+    /// </summary>
+    [Fact]
+    public async Task Backfill_AfterResolutionChange_PrefersIdsAbsentAtEveryResolution()
+    {
+        IReadOnlyList<(string Date, string Id)> rows = ReadmeRows();
+        CachedImage[] fiveUhd = rows.Take(5).Select((r, i) => Cached(r.Id, r.Date, 100 - i * 10)).ToArray();
+        ImageCache cache = SeedCache(fiveUhd, applied: NewestId);
+        Settings settings = Newest();
+        settings.Resolution = "1920x1080";
+        Harness h = Build(settings, new AppState { CurrentImageId = NewestId, LastSeenNewestId = NewestId, NextDueUtc = T0.AddMinutes(20) }, cache);
+
+        await StartAsync(h);
+
+        Assert.Contains("tick done reason=Startup result=NoOp decision=NoOp why=not-due", LogText());
+        Assert.Equal(1, ImageDownloads(h));                                // the backfill only
+        Assert.Equal(6, h.Cache.Index.Images.Count);                       // 5 UHD + the backfill
+        string sixthDay = rows[5].Id;
+        CachedImage backfilled = Assert.Single(h.Cache.Index.Images, i => string.Equals(i.Id, sixthDay, StringComparison.Ordinal));
+        Assert.Equal("1920x1080", backfilled.Resolution);
+        Assert.EndsWith(".1920x1080.jpg", backfilled.File, StringComparison.Ordinal);
+        Assert.Contains($"backfill id={sixthDay} file={backfilled.File} cached=6/10", LogText(), StringComparison.Ordinal);
+        foreach ((string _, string id) in rows.Take(5))
+        {
+            CachedImage only = Assert.Single(h.Cache.Index.Images, i => string.Equals(i.Id, id, StringComparison.Ordinal));   // no 1080 twin
+            Assert.Equal("UHD", only.Resolution);
+        }
+    }
+
+    /// <summary>IN-03 fallback: once every catalog row is held at some resolution, the original "not cached at this resolution" rule resumes, newest first.</summary>
+    [Fact]
+    public async Task Backfill_AfterResolutionChange_FallsBackToCurrentResolutionRule_WhenEveryRowIsCachedSomewhere()
+    {
+        ImageCache cache = SeedCache([Cached(NewestId, "2026-09-20", 10), Cached(SecondId, "2026-09-19", 0)], applied: NewestId);
+        Settings settings = Newest();
+        settings.Resolution = "1920x1080";
+        Harness h = Build(settings, new AppState { CurrentImageId = NewestId, LastSeenNewestId = NewestId, NextDueUtc = T0.AddMinutes(20) }, cache, fake: Routes(ReadmeWithRows(2)));
+
+        await StartAsync(h);                                               // both rows are held at UHD: pass 1 finds nothing
+
+        Assert.Equal(1, ImageDownloads(h));
+        Assert.Equal(3, h.Cache.Index.Images.Count);
+        CachedImage newestTwin = Assert.Single(h.Cache.Index.Images, i => string.Equals(i.Id, NewestId, StringComparison.Ordinal) && string.Equals(i.Resolution, "1920x1080", StringComparison.Ordinal));
+        Assert.EndsWith(".1920x1080.jpg", newestTwin.File, StringComparison.Ordinal);
+        Assert.Contains($"backfill id={NewestId} file={newestTwin.File} cached=3/10", LogText(), StringComparison.Ordinal);
+
+        await AdvanceAsync(h, Interval);                                   // pass 2 again: the day-2 twin
+
+        Assert.Equal(2, ImageDownloads(h));
+        Assert.Equal(4, h.Cache.Index.Images.Count);
+        Assert.Single(h.Cache.Index.Images, i => string.Equals(i.Id, SecondId, StringComparison.Ordinal) && string.Equals(i.Resolution, "1920x1080", StringComparison.Ordinal));
+        Assert.Equal(1, LogCount($"backfill id={SecondId} "));
+
+        await AdvanceAsync(h, Interval);                                   // now every row is cached at 1080 too
+
+        Assert.Equal(1, LogCount("backfill skipped cause=no-candidate"));
+        Assert.Equal(2, ImageDownloads(h));
+    }
+
     [Fact]
     public async Task Backfill_LogOrder_ApplyThenBackfillThenTickDone()
     {
