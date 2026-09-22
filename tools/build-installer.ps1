@@ -43,6 +43,9 @@ if ([System.IO.Path]::IsPathRooted($OutDir)) {
 } else {
     $outAbs = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutDir))
 }
+# GetFullPath keeps a trailing backslash; quoted as "/OD:\x\some dir\" the closing \" reads as an escaped quote to the
+# C runtime and ISCC receives a mangled output directory (IN-05). A drive root ("D:\") is left alone.
+if ($outAbs.Length -gt 3) { $outAbs = $outAbs.TrimEnd('\') }
 
 # ---- 2. publish ------------------------------------------------------------------------------------------
 
