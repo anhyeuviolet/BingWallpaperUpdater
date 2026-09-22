@@ -147,11 +147,13 @@ end;
 
 // Ordering fact 1: Setup calls InitializeSetup before its own AppMutex check (issrc Setup.MainFunc.pas), so a running
 // instance is asked to exit here and the "is currently running" prompt only appears if it did not comply in 10 s.
+// The elevated warning defaults to Cancel on screen (MB_DEFBUTTON2) but answers OK under /SUPPRESSMSGBOXES: a plain
+// MsgBox is never suppressed, which would block every silent install driven from an elevated shell (probe, CI).
 function InitializeSetup(): Boolean;
 begin
   Result := True;
   if IsAdmin then
-    Result := MsgBox(FmtMessage(CustomMessage('ElevatedWarning'), [ExpandConstant('{username}')]), mbConfirmation, MB_OKCANCEL or MB_DEFBUTTON2) = IDOK;
+    Result := SuppressibleMsgBox(FmtMessage(CustomMessage('ElevatedWarning'), [ExpandConstant('{username}')]), mbConfirmation, MB_OKCANCEL or MB_DEFBUTTON2, IDOK) = IDOK;
   if Result then
     RequestAppExit;
 end;
