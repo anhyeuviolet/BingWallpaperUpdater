@@ -212,26 +212,27 @@ public sealed class CatalogServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GetNewest_BothSourcesFail_ReturnsNullAndLogsPipelineFailure()
+    public async Task GetCatalog_BothSourcesFail_ReturnsEmptyWithoutPipelineWarning()
     {
         FakeHttpHandler fake = Fake(_ => FakeHttpHandler.Text(500, ""), _ => FakeHttpHandler.Json(200, "null"));
 
-        CatalogEntry? newest = await Service(fake).GetNewestAsync("en-US", CancellationToken.None);
+        IReadOnlyList<CatalogEntry> rows = await Service(fake).GetCatalogAsync("en-US", CancellationToken.None);
 
-        Assert.Null(newest);
-        Assert.Contains("pipeline failed stage=catalog", LogText());
+        Assert.Empty(rows);
+        // The "pipeline failed stage=catalog" warning belongs to the rotation tick (RotationServiceTests), not here.
+        Assert.DoesNotContain("pipeline failed stage=catalog", LogText());
     }
 
     [Fact]
-    public async Task GetNewest_ReturnsFirstEnrichedRow()
+    public async Task GetCatalog_FirstRowIsNewestEnrichedReadmeRow()
     {
         FakeHttpHandler fake = Fake(_ => FakeHttpHandler.Text(200, Readme()), _ => FakeHttpHandler.Json(200, Archive()));
 
-        CatalogEntry? newest = await Service(fake).GetNewestAsync("en-US", CancellationToken.None);
+        IReadOnlyList<CatalogEntry> rows = await Service(fake).GetCatalogAsync("en-US", CancellationToken.None);
 
-        Assert.NotNull(newest);
-        Assert.Equal(MarkdownCatalogParser.Parse(Readme())[0].Id, newest.Id);
-        Assert.NotNull(newest.Title);
+        Assert.NotEmpty(rows);
+        Assert.Equal(MarkdownCatalogParser.Parse(Readme())[0].Id, rows[0].Id);
+        Assert.NotNull(rows[0].Title);
     }
 
     // ---- encoding -------------------------------------------------------------------------------

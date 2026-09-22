@@ -790,6 +790,7 @@ public sealed class RotationServiceTests : IDisposable
         Assert.Equal(1, h.Service.FailureStage);
         Assert.Equal(T0 + TimeSpan.FromMinutes(5), h.Service.RetryDueUtc);
         Assert.Equal(T0 + Interval, h.Service.NextDueUtc);
+        Assert.Contains("pipeline failed stage=catalog error=no catalog source produced rows", LogText());   // the tick owns this token
         Assert.Contains("tick done reason=Startup result=FetchFailed decision=NoOp why=unchanged", LogText());
         Assert.Contains($"retry scheduled stage=1 at={(T0 + TimeSpan.FromMinutes(5)):O}", LogText());
         Assert.Contains($"retry={(T0 + TimeSpan.FromMinutes(5)):O}", LogText());

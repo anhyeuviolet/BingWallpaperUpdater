@@ -47,22 +47,10 @@ public sealed class CatalogService
     /// </summary>
     public bool GitHubDisabledForSession { get; private set; }
 
-    /// <summary>The newest catalog entry, or null when neither source produced a row (already logged).</summary>
-    public async Task<CatalogEntry?> GetNewestAsync(string market, CancellationToken ct)
-    {
-        IReadOnlyList<CatalogEntry> rows = await GetCatalogAsync(market, ct).ConfigureAwait(false);
-        if (rows.Count == 0)
-        {
-            Log.Warn("pipeline failed stage=catalog error=no catalog source produced rows");
-            return null;
-        }
-
-        return rows[0];
-    }
-
     /// <summary>
     /// The full list, newest first: README rows enriched from HPImageArchive for <c>en-US</c>, otherwise
-    /// HPImageArchive alone. Empty only when both sources are empty. Never throws for network or parse reasons.
+    /// HPImageArchive alone. Empty only when both sources are empty — the caller (the rotation tick) owns the
+    /// <c>pipeline failed stage=catalog</c> warning for that case. Never throws for network or parse reasons.
     /// </summary>
     public async Task<IReadOnlyList<CatalogEntry>> GetCatalogAsync(string market, CancellationToken ct)
     {
