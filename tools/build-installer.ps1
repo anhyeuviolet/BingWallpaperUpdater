@@ -8,7 +8,7 @@
 #
 #   -Version      X.Y.Z (default 0.0.0); becomes AppVersion / OutputBaseFilename and the assembly version.
 #   -OutDir       output folder for the Setup.exe (default dist, gitignored).
-#   -SkipPublish  reuse the existing publish\ folder instead of running dotnet publish.
+#   -SkipPublish  reuse the existing publish\ folder instead of deleting it and running dotnet publish.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-installer.ps1 -Version 0.0.0
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-installer.ps1 -Version 1.2.3 -SkipPublish
@@ -47,6 +47,16 @@ if ([System.IO.Path]::IsPathRooted($OutDir)) {
 # ---- 2. publish ------------------------------------------------------------------------------------------
 
 if (-not $SkipPublish) {
+    # dotnet publish overwrites what it produces but never deletes what it does not, and [Files] packages the whole
+    # folder, so an older, Debug or framework-dependent publish left here would ship inside the installer. Guarded
+    # like the data-folder deletes in the other tools: only <repo>\publish is ever removed.
+    if (-not $publishDir.StartsWith($repoRoot + '\', [System.StringComparison]::OrdinalIgnoreCase) -or -not $publishDir.EndsWith('\publish', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Fail "refusing to delete '$publishDir' - not the repository publish folder"
+    }
+    if (Test-Path -LiteralPath $publishDir) {
+        Write-Host "Removing previous publish folder $publishDir"
+        Remove-Item -LiteralPath $publishDir -Recurse -Force
+    }
     Write-Host "Publishing version $Version to $publishDir"
     Push-Location $repoRoot
     try {
