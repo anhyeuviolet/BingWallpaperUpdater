@@ -191,7 +191,9 @@ begin
     Lang := 'vi'
   else
     Lang := 'auto';
-  SaveStringToFile(SettingsPath,
+  // Logged, not fatal (IN-04): on a read-only or redirected %LocalAppData% the app creates defaults on first launch,
+  // which silently drops the installer language and autostart choice; the /LOG file the probe collects shows why.
+  if not SaveStringToFile(SettingsPath,
     '{' + #13#10 +
     '  "schemaVersion": 1,' + #13#10 +
     '  "market": "en-US",' + #13#10 +
@@ -201,7 +203,8 @@ begin
     '  "language": "' + Lang + '",' + #13#10 +
     '  "monitorMode": "same",' + #13#10 +
     '  "autostart": ' + Auto + #13#10 +
-    '}' + #13#10, False);
+    '}' + #13#10, False) then
+    Log('settings.json seed failed: ' + SettingsPath);
 end;
 
 // Ordering fact 2: the uninstaller raises usAppMutexCheck before UninstLog.CheckMutexes (issrc Setup.Uninstall.pas),
