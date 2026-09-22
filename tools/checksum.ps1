@@ -48,8 +48,17 @@ function Get-Sha256Hex([string]$path) {
         $hex = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
     } else {
         # certutil prints: "SHA256 hash of <file>:", then the hex (spaced on older builds), then "CertUtil: ... completed successfully."
-        $lines = @(& certutil -hashfile $path SHA256 2>&1 | ForEach-Object { [string]$_ })
-        if ($LASTEXITCODE -ne 0 -or $lines.Count -lt 2) { throw "certutil failed for $path (exit $LASTEXITCODE)" }
+        # Its failure text goes to stderr; in Windows PowerShell 5.1 a stderr line under 2>&1 is a terminating
+        # NativeCommandError while $ErrorActionPreference is 'Stop', so capture with 'Continue' and judge the exit code.
+        $prevErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $lines = @(& certutil -hashfile $path SHA256 2>&1 | ForEach-Object { [string]$_ })
+            $certutilExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevErrorAction
+        }
+        if ($certutilExit -ne 0 -or $lines.Count -lt 2) { throw "certutil failed for $path (exit $certutilExit)" }
         $hex = ($lines[1] -replace '\s', '')
     }
     $hex = $hex.ToLowerInvariant()

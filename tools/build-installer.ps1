@@ -80,8 +80,17 @@ Write-Host "Using $iscc"
 
 New-Item -ItemType Directory -Path $outAbs -Force | Out-Null
 $isccArgs = @('/Qp', "/DAppVersion=$Version", "/DPublishDir=$publishDir", "/O$outAbs", $scriptPath)
-$compilerOutput = @(& $iscc @isccArgs 2>&1 | ForEach-Object { [string]$_ })
-$isccExit = $LASTEXITCODE
+# ISCC writes compile errors (and, under /Q, warnings) to stderr. In Windows PowerShell 5.1 the first stderr line a
+# native command emits under 2>&1 becomes a terminating NativeCommandError while $ErrorActionPreference is 'Stop',
+# which would abort before the FAIL line below; capture with 'Continue' so both streams arrive as plain text.
+$prevErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $compilerOutput = @(& $iscc @isccArgs 2>&1 | ForEach-Object { [string]$_ })
+    $isccExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevErrorAction
+}
 if ($isccExit -ne 0) {
     $compilerOutput | ForEach-Object { Write-Host $_ }
     Fail "ISCC exited with code $isccExit"
