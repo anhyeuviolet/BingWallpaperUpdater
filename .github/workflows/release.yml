@@ -9,8 +9,10 @@
 # Runner: `windows-2025` pinned by label (Image Version 20260913.261.1 at planning time) - never the
 # floating "latest" label, which moves under the workflow. The .NET SDK is restored from global.json
 # through actions/setup-dotnet even though the image ships it, and Inno Setup 6.7.1 is installed
-# explicitly through Chocolatey even though the image ships 6.7.1 today: the image can drift to Inno 7
-# (different install folder, different CLI) and the build must keep producing the same installer.
+# explicitly through Chocolatey (with --allow-downgrade) even though the image ships 6.7.1 today: the image can
+# drift to Inno 7 (different install folder, different CLI) and the build must keep producing the same installer,
+# so the step also asserts the installed 6.7.x version and tools/build-installer.ps1 uses the fixed
+# "Inno Setup 6\ISCC.exe" path before any iscc shim on PATH.
 #
 # Secrets: none. The only token is the automatic GITHUB_TOKEN; the top level is contents: read, only the
 # tag-gated `release` job asks for contents: write, and the id-token / attestations write scopes on the
@@ -80,7 +82,9 @@ jobs:
 
       - name: Install Inno Setup 6.7.1
         run: |
-          choco install innosetup --version=6.7.1 -y --no-progress
+          # --allow-downgrade: without it Chocolatey leaves a newer preinstalled version in place ("a newer version
+          # is already installed", exit 0), so the pin would do nothing once the image ships Inno Setup 7.
+          choco install innosetup --version=6.7.1 -y --no-progress --allow-downgrade
           $chocoExit = $LASTEXITCODE
           $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
           if ($chocoExit -ne 0) {
@@ -90,10 +94,23 @@ jobs:
             }
             Write-Warning "choco install innosetup exited $chocoExit; using the preinstalled copy at $iscc"
           }
-          if (Test-Path -LiteralPath $iscc) {
-            $ver = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
-            Write-Host "ISCC.exe present at $iscc (ProductVersion $ver)"
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            Write-Error "ISCC.exe missing at $iscc"
+            exit 1
           }
+          # ISCC.exe carries no version resource (ProductVersion 0.0.0.0) and its banner says only "Inno Setup 6",
+          # so the installed version is read from the uninstall entry Inno Setup's own installer writes.
+          $ver = ''
+          foreach ($key in @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+                             'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1')) {
+            $entry = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+            if ($null -ne $entry -and $entry.DisplayVersion) { $ver = [string]$entry.DisplayVersion; break }
+          }
+          if ($ver -notmatch '^6\.7\.') {
+            Write-Error "unexpected Inno Setup version '$ver' behind $iscc (expected 6.7.x)"
+            exit 1
+          }
+          Write-Host "ISCC.exe present at $iscc (Inno Setup $ver)"
 
       - name: Publish and compile the installer
         run: |

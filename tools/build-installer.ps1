@@ -65,15 +65,17 @@ if ($pdbs.Count -gt 0) { Fail "publish folder contains $($pdbs.Count) .pdb file(
 
 # ---- 3. compiler -----------------------------------------------------------------------------------------
 
+# The fixed Inno Setup 6 path comes first so the compiler the release workflow pins (and asserts) is the one that
+# runs; an `iscc` shim on PATH (Chocolatey) could otherwise point at whatever major the image happens to ship.
 $iscc = $null
-$shim = Get-Command iscc -ErrorAction SilentlyContinue
-if ($null -ne $shim) {
-    $iscc = $shim.Source
+$candidate = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+if (Test-Path $candidate) {
+    $iscc = $candidate
 } else {
-    $candidate = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-    if (Test-Path $candidate) { $iscc = $candidate }
+    $shim = Get-Command iscc -ErrorAction SilentlyContinue
+    if ($null -ne $shim) { $iscc = $shim.Source }
 }
-if ($null -eq $iscc) { Fail 'ISCC.exe not found (no iscc on PATH and no "Inno Setup 6\ISCC.exe" under Program Files (x86))' }
+if ($null -eq $iscc) { Fail 'ISCC.exe not found (no "Inno Setup 6\ISCC.exe" under Program Files (x86) and no iscc on PATH)' }
 Write-Host "Using $iscc"
 
 New-Item -ItemType Directory -Path $outAbs -Force | Out-Null
