@@ -1977,23 +1977,114 @@ public sealed class RotationServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task OnDisplayChanged_WhileTickRunning_Skips()
+    public async Task OnDisplayChanged_WhileTickRunning_LogsBusy_ThenDeferredReapplyRunsAfterTickReleasesGate()
     {
+        // WR-05: a display re-apply that meets a held gate is not dropped — the tick's finally runs it after the
+        // release. Here the tick's own apply (monitors enumerated at apply time) already covers the attached set, so
+        // the deferred re-apply is the unchanged case; the point is that it RAN.
         var dispatcher = new BlockingUiDispatcher();
         Harness h = Build(PerMonitor(), new AppState(), applier: TwoMonitorApplier(), dispatcher: dispatcher);
         Task<TickResult> tick = h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
         await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.True(h.Service.IsTickRunning);
 
+        var deferred = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Service.StateChanged += () =>
+        {
+            if (!h.Service.IsTickRunning && LogCount("reapply skipped reason=display cause=unchanged") == 1)
+            {
+                deferred.TrySetResult();
+            }
+        };
+
         h.Service.OnDisplayChanged();
         _time.Advance(TimeSpan.FromSeconds(3));   // the debounce fires while the tick still holds the gate
 
         Assert.Equal(1, LogCount("reapply skipped reason=display cause=busy"));
         Assert.Equal(0, LogCount("reapply reason=display"));
+        Assert.Equal(0, LogCount("reapply skipped reason=display cause=unchanged"));
 
         dispatcher.Release();
         Assert.Equal(TickResult.Applied, await tick.WaitAsync(TimeSpan.FromSeconds(10)));
-        Assert.Single(h.Applier.PerMonitorCalls);   // the tick's own apply; the skipped re-apply was never queued
+        await deferred.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Single(h.Applier.PerMonitorCalls);   // the tick's own apply covered both monitors
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=unchanged"));   // the deferred re-apply ran
+        Assert.Equal(0, LogCount("reapply reason=display"));
+        Assert.False(h.Service.IsTickRunning);
+
+        // The flag was consumed: an unchanged signal later is one more unchanged skip, never a second deferred run.
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+        Assert.Equal(2, LogCount("reapply skipped reason=display cause=unchanged"));
+        Assert.Single(h.Applier.PerMonitorCalls);
+    }
+
+    [Fact]
+    public async Task OnDisplayChanged_DockWhileTickRunning_TickApplyFails_DeferredReapplyCoversNewMonitorAfterRelease()
+    {
+        // WR-05: dock a third display while a Next tick holds the gate at its apply, and let that apply fail (the
+        // shell is still reconfiguring). Before the fix the busy display signal was dropped and the new monitor kept
+        // whatever the shell assigned until the next display signal or applying tick; now the tick's release runs
+        // the deferred display re-apply, which plans over all three monitors.
+        var dispatcher = new BlockingUiDispatcher();
+        ImageCache cache = SeedCache([Cached(MiddleId, "2026-09-17", 60), Cached(OldestId, "2026-09-14", 0)]);
+        Harness h = Build(PerMonitor(), new AppState(), cache, applier: TwoMonitorApplier(), dispatcher: dispatcher);
+
+        Task<TickResult> startup = h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));
+        dispatcher.Release();
+        Assert.Equal(TickResult.Applied, await startup.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Single(h.Applier.PerMonitorCalls);
+        Assert.Equal([NewestId, MiddleId], h.Cache.Index.Applied);
+        dispatcher.Rearm();
+
+        var deferred = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Service.StateChanged += () =>
+        {
+            // The tick's own raise sees two per-monitor calls; only the deferred re-apply's post-release raise matches.
+            if (h.Applier.PerMonitorCalls.Count == 3 && !h.Service.IsTickRunning)
+            {
+                deferred.TrySetResult();
+            }
+        };
+
+        Task<TickResult> next = h.Service.RunTickAsync(TickReason.Next, CancellationToken.None);
+        await dispatcher.Entered.WaitAsync(TimeSpan.FromSeconds(10));   // parked at its per-monitor apply
+        Assert.True(h.Service.IsTickRunning);
+
+        h.Applier.Monitors.Add(ThirdMonitor);   // docked during the tick...
+        h.Service.OnDisplayChanged();
+        _time.Advance(TimeSpan.FromSeconds(3));   // ...and the debounce fires while the tick still holds the gate
+
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=busy"));
+        Assert.Equal(0, LogCount("reapply reason=display"));
+
+        h.Applier.FailNext = true;   // the tick's apply fails: the attached set stays uncommitted (WR-04)
+        dispatcher.Release();
+        Assert.Equal(TickResult.ApplyFailed, await next.WaitAsync(TimeSpan.FromSeconds(10)));
+        await deferred.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(3, h.Applier.PerMonitorCalls.Count);   // startup, the failed Next, the deferred display re-apply
+        IReadOnlyList<(MonitorHandle Monitor, string AbsolutePath)> reapply = h.Applier.PerMonitorCalls[2];
+        Assert.Equal(3, reapply.Count);
+        Assert.Contains("AlphornBavaria_EN-US6200857270", reapply[0].AbsolutePath);   // the current image stays primary
+        Assert.Contains(MiddleId, reapply[1].AbsolutePath);
+        Assert.Contains(OldestId, reapply[2].AbsolutePath);
+        Assert.Equal([NewestId, MiddleId, OldestId], h.Cache.Index.Applied);
+        Assert.Equal(1, LogCount("reapply reason=display monitors=3 result=Applied"));
+        Assert.Equal(NewestId, h.State.CurrentImageId);
+        Assert.False(h.Service.IsTickRunning);
+        string log = LogText();
+        int tickDone = log.IndexOf("tick done reason=Next", StringComparison.Ordinal);
+        int reapplied = log.IndexOf("reapply reason=display monitors=3", StringComparison.Ordinal);
+        Assert.True(tickDone >= 0 && reapplied > tickDone, "the deferred display re-apply must run after the tick ended");
+
+        // Committed by the deferred re-apply: the same three monitors signalling again is the unchanged case.
+        h.Service.OnDisplayChanged();
+        await AdvanceAsync(h, TimeSpan.FromSeconds(3));
+        Assert.Equal(3, h.Applier.PerMonitorCalls.Count);
+        Assert.Equal(1, LogCount("reapply skipped reason=display cause=unchanged"));
     }
 
     [Fact]

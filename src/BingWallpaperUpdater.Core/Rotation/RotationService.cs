@@ -54,8 +54,12 @@ public sealed class RotationService : IDisposable
     // still sees the difference and retries (WR-01). Guarded by _sync.
     private string _appliedMonitorMode;
     // Set by a forced mode re-apply BEFORE its gate attempt, cleared when a forced re-apply owns the gate and by
-    // ReapplyIfModePending: the one deferred piece of work in the service (never a tick, D-01). Guarded by _sync.
+    // ReapplyIfPending: one of the two deferred pieces of work in the service (never a tick, D-01). Guarded by _sync.
     private bool _modeReapplyPending;
+    // The display twin (WR-05): set by a display-change re-apply BEFORE its gate attempt, cleared when one owns the
+    // gate and by ReapplyIfPending, so a dock/undock whose debounce fires while a tick holds the gate is re-applied at
+    // the holder's release instead of waiting for the next display signal or the next applying tick. Guarded by _sync.
+    private bool _displayReapplyPending;
     private bool _startupTickDone;
     private volatile bool _disposed;
     private CancellationToken _ct;
@@ -219,7 +223,7 @@ public sealed class RotationService : IDisposable
         {
             _gate.Release();
             RaiseStateChanged();     // after the release: a subscriber's Snapshot() must read TickRunning == false
-            ReapplyIfModePending();  // after the release (its own Wait(0) would report busy) and after the raise (the window already knows the tick ended)
+            ReapplyIfPending();      // after the release (its own Wait(0) would report busy) and after the raise (the window already knows the tick ended)
         }
     }
 
@@ -237,28 +241,34 @@ public sealed class RotationService : IDisposable
     }
 
     /// <summary>
-    /// Runs after every gate release (a tick's or a re-apply's). The one deferred piece of work in the service: a
-    /// forced monitor-mode re-apply the user asked for while the gate was held (<c>reapply skipped ... cause=busy</c>)
-    /// is run now, so the second monitor changes within seconds of the holder finishing instead of at the next new
-    /// image (WR-01). The flag is consumed either way — equal modes mean the holder already applied in the new mode.
-    /// Ticks are never deferred (D-01), and a forced re-apply that owns the gate clears the flag itself, so a failed
-    /// or no-current re-apply can never re-dispatch (T-03-22).
+    /// Runs after every gate release (a tick's or a re-apply's). The only deferred work in the service — a re-apply
+    /// that met a held gate (<c>reapply skipped ... cause=busy</c>) — is run now, so the desktop changes within
+    /// seconds of the holder finishing instead of at the next new image: a forced monitor-mode switch the user asked
+    /// for (WR-01), or a dock/undock whose debounce fired during the hold (WR-05). Both flags are consumed either
+    /// way — equal modes mean the holder already applied in the new mode, and a display re-apply compares the
+    /// attached set itself, so it is <c>cause=unchanged</c> when the holder's apply already covered the new monitors.
+    /// A pending mode switch wins: the forced re-apply applies over the monitors attached now and commits that set,
+    /// so the display flag needs no separate dispatch. Ticks are never deferred (D-01), and a re-apply that owns the
+    /// gate clears its own flag, so a failed or no-current re-apply can never re-dispatch (T-03-22).
     /// </summary>
-    private void ReapplyIfModePending()
+    private void ReapplyIfPending()
     {
         if (_disposed)
         {
             return;
         }
 
-        bool pending;
+        bool mode;
+        bool display;
         lock (_sync)
         {
-            pending = _modeReapplyPending && !string.Equals(_settings.MonitorMode, _appliedMonitorMode, StringComparison.Ordinal);
+            mode = _modeReapplyPending && !string.Equals(_settings.MonitorMode, _appliedMonitorMode, StringComparison.Ordinal);
+            display = _displayReapplyPending && _settings.IsPerMonitor;
             _modeReapplyPending = false;
+            _displayReapplyPending = false;
         }
 
-        if (!pending)
+        if (!mode && !display)
         {
             return;
         }
@@ -266,11 +276,13 @@ public sealed class RotationService : IDisposable
         // Fire-and-forget from a finally on a thread-pool continuation: nothing may escape (WR-02). RunReapplyAsync never throws.
         try
         {
-            _ = RunReapplyAsync("settings", force: true);
+            _ = mode
+                ? RunReapplyAsync("settings", force: true)
+                : RunReapplyAsync("display", force: false);
         }
         catch (Exception ex)
         {
-            Log.Warn("mode reapply failed", ex);
+            Log.Warn("deferred reapply failed", ex);
         }
     }
 
@@ -365,7 +377,7 @@ public sealed class RotationService : IDisposable
         // per-monitor -> the plan over the current image; same -> the current image on every monitor. Forced, so the
         // attached-set comparison does not suppress it. Nothing is committed here: _appliedMonitorMode moves only
         // when an apply succeeds (WR-01). A busy gate defers the switch to the holder's release
-        // (ReapplyIfModePending); a failure or an empty desktop leaves the setting pending for the next
+        // (ReapplyIfPending); a failure or an empty desktop leaves the setting pending for the next
         // ApplySettings / applying tick. Started LAST: the re-apply's own finally raises after its release, so the
         // raise above reflects the schedule only and the window never observes a transient gate hold that nothing
         // clears (CR-01).
@@ -815,9 +827,9 @@ public sealed class RotationService : IDisposable
     /// result=&lt;Applied|Failed&gt;</c>, <c>reapply skipped reason=&lt;r&gt; cause=&lt;unchanged|same-mode|busy|no-current&gt;</c>
     /// or <c>reapply failed reason=&lt;r&gt; error=</c>; it is never re-armed.
     /// Returns true only when an apply ran and reported Ok — and only then is the monitor mode it applied in committed
-    /// to <c>_appliedMonitorMode</c> (WR-01). A forced re-apply marks itself pending before its gate attempt: when the
-    /// gate is busy the holder's finally runs the switch after its release (<see cref="ReapplyIfModePending"/>); when
-    /// this call owns the gate it clears the flag, so its own failure never dispatches another attempt (T-03-22).
+    /// to <c>_appliedMonitorMode</c> (WR-01). Either kind marks itself pending before its gate attempt: when the
+    /// gate is busy the holder's finally runs it after its release (<see cref="ReapplyIfPending"/>, WR-01 / WR-05);
+    /// when this call owns the gate it clears its flag, so its own failure never dispatches another attempt (T-03-22).
     /// </summary>
     private async Task<bool> RunReapplyAsync(string reason, bool force)
     {
@@ -832,28 +844,39 @@ public sealed class RotationService : IDisposable
             return false;
         }
 
-        if (force)
+        lock (_sync)
         {
-            lock (_sync)
+            // BEFORE the gate attempt: a holder releasing in between still sees it (WR-01 for the mode switch, WR-05
+            // for the display change) — the flag for the reason this call serves.
+            if (force)
             {
-                _modeReapplyPending = true;   // BEFORE the gate attempt: a holder releasing in between still sees it
+                _modeReapplyPending = true;
+            }
+            else
+            {
+                _displayReapplyPending = true;
             }
         }
 
         if (!_gate.Wait(0, CancellationToken.None))
         {
-            Log.Info($"reapply skipped reason={reason} cause=busy");   // the gate holder's finally re-checks the pending mode switch (ReapplyIfModePending) after its release
+            Log.Info($"reapply skipped reason={reason} cause=busy");   // the gate holder's finally re-checks the pending re-apply (ReapplyIfPending) after its release
             return false;
         }
 
         bool applied = false;
         try
         {
-            if (force)
+            lock (_sync)
             {
-                lock (_sync)
+                // This call IS the follow-up for its reason; nothing else may dispatch another one for it.
+                if (force)
                 {
-                    _modeReapplyPending = false;   // this call IS the follow-up; nothing else may dispatch another one
+                    _modeReapplyPending = false;
+                }
+                else
+                {
+                    _displayReapplyPending = false;
                 }
             }
 
@@ -929,7 +952,7 @@ public sealed class RotationService : IDisposable
         {
             _gate.Release();
             RaiseStateChanged();     // after the release: a subscriber's Snapshot() must read TickRunning == false (CR-01)
-            ReapplyIfModePending();  // a switch that met THIS re-apply's gate hold runs now
+            ReapplyIfPending();      // a switch or display change that met THIS re-apply's gate hold runs now
         }
 
         return applied;
