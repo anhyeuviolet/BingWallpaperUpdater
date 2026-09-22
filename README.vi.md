@@ -153,7 +153,7 @@ Mỗi lần kiểm tra theo lịch, ứng dụng tải nhiều nhất một ản
 
 ## Quy trình phát hành
 
-1. Đẩy thẻ `vX.Y.Z` trên `master` (phải trùng `<Version>` trong `Directory.Build.props`).
+1. Đẩy thẻ `vX.Y.Z` trên `master`. Thẻ phải trùng `<Version>` trong `Directory.Build.props`: workflow so sánh hai giá trị và dừng build với lỗi nếu lệch nhau, nên hãy nâng `<Version>` trong props trước.
 2. GitHub Actions (`.github/workflows/release.yml`, trên runner `windows-2025` được ghim) chạy kiểm thử, publish ứng dụng, biên dịch bộ cài bằng Inno Setup 6.7.1, ghi `BingWallpaperUpdater-X.Y.Z-x64-Setup.exe.sha256`, kiểm tra lại bằng `sha256sum -c`, rồi tạo một bản phát hành **nháp** tên `BingWallpaperUpdater X.Y.Z` với hai tệp đó đính kèm.
 3. Người bảo trì tự viết ghi chú phát hành theo `.github/RELEASE_NOTES_TEMPLATE.md` (điểm nổi bật, câu về SmartScreen, mã SHA-256, dòng bộ nhớ, Windows được hỗ trợ) rồi bấm Publish. Không có gì được công bố tự động.
 

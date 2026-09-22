@@ -153,7 +153,7 @@ Per scheduled check it downloads at most one new image plus, while the cache is 
 
 ## Release process
 
-1. Push a tag `vX.Y.Z` on `master` (it must match `<Version>` in `Directory.Build.props`).
+1. Push a tag `vX.Y.Z` on `master`. It must match `<Version>` in `Directory.Build.props`: the workflow compares the two and fails the build on a mismatch, so bump the props first.
 2. GitHub Actions (`.github/workflows/release.yml`, on a pinned `windows-2025` runner) runs the tests, publishes the app, compiles the installer with Inno Setup 6.7.1, writes `BingWallpaperUpdater-X.Y.Z-x64-Setup.exe.sha256`, verifies it with `sha256sum -c`, and opens a **draft** release named `BingWallpaperUpdater X.Y.Z` with those two files attached.
 3. The maintainer writes the release notes by hand from `.github/RELEASE_NOTES_TEMPLATE.md` (highlights, the SmartScreen sentence, the SHA-256, the memory row, supported Windows) and clicks Publish. Nothing is published automatically.
 

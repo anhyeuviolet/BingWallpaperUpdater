@@ -68,6 +68,20 @@ jobs:
               exit 1
             }
             $version = $env:REF_NAME.Substring(1)
+            # The tag must agree with <Version> in Directory.Build.props (IN-06): the build stamps the tag's version
+            # through -p:Version, so without this check a tag ahead of the props would release silently while local
+            # builds and the User-Agent still carry the old number.
+            $props = Get-Content -LiteralPath Directory.Build.props -Raw
+            if ($props -notmatch '<Version>\s*([^<\s]+)\s*</Version>') {
+              Write-Error "Directory.Build.props has no <Version> element; cannot check it against tag '$env:REF_NAME'."
+              exit 1
+            }
+            $propsVersion = $Matches[1]
+            if ($propsVersion -ne $version) {
+              Write-Error "Tag '$env:REF_NAME' resolves to $version but Directory.Build.props says <Version>$propsVersion</Version>; bump the props (or fix the tag) and push again."
+              exit 1
+            }
+            Write-Host "Directory.Build.props <Version>$propsVersion</Version> matches the tag"
           } else {
             $version = '0.0.0'
           }
