@@ -226,6 +226,11 @@ internal sealed class SettingsForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+        // Auto-scaling (AutoScaleMode.Dpi at 96) has run by now and DeviceDpi is final for the monitor the window
+        // opens on, so the device-unit bounds are re-measured here through the same path OnDpiChanged uses. The
+        // constructor's values are only a first guess: if the form were ever scaled after its children were added,
+        // a LogicalToDeviceUnits box set at construction would be multiplied by DeviceDpi / 96 a second time.
+        RemeasureDeviceBounds();
         _rotation.StateChanged += _onStateChanged;
         RefreshStatus();
         LogLayout();
@@ -241,17 +246,9 @@ internal sealed class SettingsForm : Form
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
-        foreach (Label l in _wrapping)
-        {
-            l.MaximumSize = new Size(LogicalToDeviceUnits(WrapLogicalWidth), 0);
-        }
-
         // WinForms has already rescaled Font and DeviceDpi inside base.OnDpiChanged, so the boxes are re-measured
         // at the new DPI; without this they would keep the old DPI's pixel size and clip to fewer lines.
-        foreach ((Label l, int lines) in _fixed)
-        {
-            l.Size = FixedValueSize(l, lines);
-        }
+        RemeasureDeviceBounds();
 
         foreach (ComboBox c in _combos)
         {
@@ -262,6 +259,25 @@ internal sealed class SettingsForm : Form
         }
 
         LogLayout();
+    }
+
+    /// <summary>
+    /// The one place the device-unit bounds are computed from the current font and <see cref="Control.DeviceDpi"/>:
+    /// the wrap bound of every wrapping label and the fixed box of every title/copyright label. Called from
+    /// <see cref="OnLoad"/> (auto-scale done, DeviceDpi final) and <see cref="OnDpiChanged"/> (font and DeviceDpi
+    /// already rescaled by the base class), so both paths agree on the same numbers.
+    /// </summary>
+    private void RemeasureDeviceBounds()
+    {
+        foreach (Label l in _wrapping)
+        {
+            l.MaximumSize = new Size(LogicalToDeviceUnits(WrapLogicalWidth), 0);
+        }
+
+        foreach ((Label l, int lines) in _fixed)
+        {
+            l.Size = FixedValueSize(l, lines);
+        }
     }
 
     /// <summary>One line per window open (and per DPI change) so the geometry is verifiable from log.txt without a screenshot.</summary>
@@ -512,8 +528,9 @@ internal sealed class SettingsForm : Form
 
     /// <summary>
     /// A read-only value label with a fixed box (not AutoSize): the wrap width by <paramref name="lines"/> text lines,
-    /// measured by <see cref="FixedValueSize"/> from the live font at the current DPI and re-measured in
-    /// <see cref="OnDpiChanged"/>. <see cref="Label.AutoEllipsis"/> word-wraps inside the box, ends a longer text with
+    /// measured by <see cref="FixedValueSize"/> from the live font at the current DPI here as a first value and
+    /// re-measured by <see cref="RemeasureDeviceBounds"/> in <see cref="OnLoad"/> and <see cref="OnDpiChanged"/>.
+    /// <see cref="Label.AutoEllipsis"/> word-wraps inside the box, ends a longer text with
     /// an ellipsis and shows the full text in the label's own internal ToolTip on hover (created and disposed with the
     /// label, so no extra component and nothing new for the per-open GDI count). The box contributes its
     /// <see cref="Control.Size"/> — not the text's preferred size — to the <see cref="TableLayoutPanel"/> measurement,
