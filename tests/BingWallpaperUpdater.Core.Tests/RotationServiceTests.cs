@@ -1697,7 +1697,10 @@ public sealed class RotationServiceTests : IDisposable
             }
         };
 
-        await StartAsync(h);
+        // Awaited directly rather than through StartAsync: WaitForIdleAsync takes the gate itself the moment the tick
+        // releases it, so a handler raised right after that release could read TickRunning == true from the test's
+        // own hold, not from a tick (seen once on the CI runner). The awaited call returns after the finally's raise.
+        await h.Service.RunTickAsync(TickReason.Startup, CancellationToken.None);
         Assert.Equal(1, raised);
 
         h.Service.ApplySettings();
