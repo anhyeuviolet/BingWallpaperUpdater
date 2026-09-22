@@ -112,10 +112,16 @@ const
   ApprovedKey   = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run';
   RunValueName  = 'BingWallpaperUpdater';
 
-// True when a previous install of this AppId is registered for the current user.
+var
+  // Snapshot of "a previous install of this AppId is registered for the current user", taken in InitializeSetup.
+  // Setup writes the uninstall key during the install step, before ssPostInstall, so a live RegKeyExists there
+  // would say "upgrade" on a fresh install too; every reader below uses this pre-install value instead.
+  WasUpgrade: Boolean;
+
+// True when a previous install of this AppId was registered when Setup started (see WasUpgrade).
 function IsUpgrade: Boolean;
 begin
-  Result := RegKeyExists(HKCU, UninstallKey);
+  Result := WasUpgrade;
 end;
 
 // Asks a running instance to exit through its Shutdown funnel (log: "shutdown reason=exit-signal") and waits up to
@@ -147,10 +153,13 @@ end;
 
 // Ordering fact 1: Setup calls InitializeSetup before its own AppMutex check (issrc Setup.MainFunc.pas), so a running
 // instance is asked to exit here and the "is currently running" prompt only appears if it did not comply in 10 s.
-// The elevated warning defaults to Cancel on screen (MB_DEFBUTTON2) but answers OK under /SUPPRESSMSGBOXES: a plain
-// MsgBox is never suppressed, which would block every silent install driven from an elevated shell (probe, CI).
+// It also runs before the [Tasks] Check functions are evaluated, so the upgrade snapshot taken here is what
+// "Check: not IsUpgrade" sees. The elevated warning defaults to Cancel on screen (MB_DEFBUTTON2) but answers OK
+// under /SUPPRESSMSGBOXES: a plain MsgBox is never suppressed, which would block every silent install driven from
+// an elevated shell (probe, CI).
 function InitializeSetup(): Boolean;
 begin
+  WasUpgrade := RegKeyExists(HKCU, UninstallKey);
   Result := True;
   if IsAdmin then
     Result := SuppressibleMsgBox(FmtMessage(CustomMessage('ElevatedWarning'), [ExpandConstant('{username}')]), mbConfirmation, MB_OKCANCEL or MB_DEFBUTTON2, IDOK) = IDOK;
@@ -172,7 +181,9 @@ begin
     Exit;
   ForceDirectories(DataDir);
   // The task is hidden on upgrade; an upgrade whose data folder was wiped by hand inherits the observed Run value.
-  if WizardIsTaskSelected('autostart') or (IsUpgrade and RegValueExists(HKCU, RunKey, RunValueName)) then
+  // WasUpgrade (not a live registry read: the uninstall key already exists at this step) keeps a fresh install with
+  // the task unticked from inheriting a stale Run value left by an earlier publish\ build.
+  if WizardIsTaskSelected('autostart') or (WasUpgrade and RegValueExists(HKCU, RunKey, RunValueName)) then
     Auto := 'true'
   else
     Auto := 'false';
