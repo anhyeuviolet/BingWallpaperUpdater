@@ -388,14 +388,34 @@ Add-Type -Namespace W -Name G -MemberDefinition '[DllImport("user32.dll")] publi
 Add-Type -Namespace W -Name U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 '@
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+$SW_MINIMIZE = 6
 $SW_SHOWMINNOACTIVE = 7
+
+# When the soak is started from a foreground console the app inherits foreground-activation rights and its own
+# Form.Show legitimately activates the Settings window. Hand the focus back: first to the window that had it before
+# the open (SetForegroundWindow may be refused by the foreground lock), else SW_MINIMIZE, which by definition
+# activates the next top-level window in the Z order. Only a window that still holds the foreground after both fails.
+function Restore-Focus([IntPtr]$hwnd, [IntPtr]$prevFg, [string]$what) {
+    if ([W.U]::GetForegroundWindow() -ne $hwnd) { return }
+    if ($prevFg -ne [IntPtr]::Zero -and $prevFg -ne $hwnd) {
+        [W.U]::SetForegroundWindow($prevFg) | Out-Null
+        Start-Sleep -Milliseconds 100
+        if ([W.U]::GetForegroundWindow() -ne $hwnd) { Write-Host "focus handed back to the previous window ($what)"; return }
+    }
+    [W.U]::ShowWindow($hwnd, $SW_MINIMIZE) | Out-Null
+    Start-Sleep -Milliseconds 150
+    if ([W.U]::GetForegroundWindow() -eq $hwnd) { Fail "the Settings window still holds the focus after minimize and focus restore ($what)" }
+    Write-Host "focus handed back by SW_MINIMIZE ($what)"
+}
 $WM_COMMAND = 0x0111   # wParam LOWORD = control id (0), HIWORD = BN_CLICKED (0); lParam = the button's HWND
 $script:nextHwnd = [IntPtr]::Zero
+$script:lastPrevFg = [IntPtr]::Zero
 
 # One-line ETA so the maintainer knows how long to stay away from the machine: measured tick ~0.5 s (up to ~1.5 s
 # while the backfill downloads), cycle ~1.5 s, plus the 5 s post-ticks and 20 s final settles.
@@ -452,6 +472,7 @@ function Wait-Window([System.Diagnostics.Process]$p, [bool]$open, [int]$timeoutS
 
 function Open-Settings([System.Diagnostics.Process]$p, [string]$what, [bool]$findNext = $false) {
     $skip = @(Read-Log).Count
+    $prevFg = [W.U]::GetForegroundWindow()
     try {
         $evt = [System.Threading.EventWaitHandle]::OpenExisting($showEventName)
         $evt.Set() | Out-Null
@@ -476,7 +497,8 @@ function Open-Settings([System.Diagnostics.Process]$p, [string]$what, [bool]$fin
     # stays alive and minimized (MainWindowHandle stays non-zero) and its child HWNDs keep working.
     [W.U]::ShowWindow($hwnd, $SW_SHOWMINNOACTIVE) | Out-Null
     Start-Sleep -Milliseconds 100
-    if ([W.U]::GetForegroundWindow() -eq $hwnd) { Fail "the Settings window holds the focus after being minimized ($what)" }
+    Restore-Focus $hwnd $prevFg $what
+    $script:lastPrevFg = $prevFg
     $openLine = Wait-LogLine -Pattern ([regex]::Escape($openToken)) -SkipLines $skip -Timeout 15 -Process $p
     if (-not $openLine) { Fail "no '$openToken' log line ($what)" }
 }
@@ -521,7 +543,7 @@ if ($Ticks -gt 0) {
         if (-not [W.U]::PostMessage($formHwnd, $WM_COMMAND, [IntPtr]::Zero, $script:nextHwnd)) { Fail "PostMessage WM_COMMAND failed (tick $t)" }
         $tickLine = Wait-LogLine -Pattern $tickPattern -SkipLines $skip -Timeout 90 -Process $proc
         if (-not $tickLine) { Fail "no 'tick done' log line within 90 s after Next (tick $t)" }
-        if ($t -le 3 -and [W.U]::GetForegroundWindow() -eq $formHwnd) { Fail "the Settings window took the focus after the Next click (tick $t)" }
+        if ($t -le 3) { Restore-Focus $formHwnd $script:lastPrevFg "tick $t" }
         if ($t % 10 -eq 0 -or $t -eq $Ticks) { Write-Host "tick $t/$Ticks : $tickLine" }
         if ($t -eq $Ticks -or ([DateTime]::UtcNow - $lastSample).TotalSeconds -ge $SampleIntervalSeconds) {
             Get-Sample $proc 'ticks' $t $SettingsCycles | Out-Null

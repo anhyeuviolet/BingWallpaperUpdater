@@ -39,8 +39,11 @@ quarter of an hour instead of waiting a day for 48 natural ticks:
    HWND - WinForms reflects it to the button's `Click` handler with no mouse input, no focus change and no visible
    window (a minimized window has no UI Automation subtree, and restoring one activates it). Each click is one real
    tick - catalog check on GitHub (304), Bing API, COM wallpaper apply, one backfill download until the cache is full -
-   and the tool waits for the `tick done` log line before the next click (`-TickGapSec`, 1 s, between clicks). The tool
-   fails the run if the Settings window ever holds the foreground after being minimized or after a click. A
+   and the tool waits for the `tick done` log line before the next click (`-TickGapSec`, 1 s, between clicks). When
+   the soak is started from a foreground console the app inherits foreground-activation rights and its `Show()` does
+   activate the window; the tool then hands the focus back (to the previous foreground window, else via
+   `SW_MINIMIZE`, which activates the next window in the Z order) and fails the run only if the Settings window still
+   holds the foreground after that. A
    `ticks` sample is taken every `-SampleIntervalSeconds` (15) right after a tick completes, carrying that tick's index.
    Then the window is closed and a `post-ticks` sample is taken.
 5. `final` sample after a 20 s settle with the window closed, verdict, `<csv>.result.txt`.
