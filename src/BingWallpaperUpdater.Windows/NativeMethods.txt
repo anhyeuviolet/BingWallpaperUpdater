@@ -1,7 +1,8 @@
+// DesktopWallpaper (the CreateInstance helper) and CoCreateInstance are deliberately NOT listed: the generated
+// helpers activate through the shared ComWrappers cache, whose RCW releases only from the finalizer thread (WR-02).
+// The only activation path is the private blittable import in DesktopWallpaperApplier.Activate (IN-13).
 IDesktopWallpaper
-DesktopWallpaper
 DESKTOP_WALLPAPER_POSITION
-CoCreateInstance
 CLSCTX
 SystemParametersInfo
 SYSTEM_PARAMETERS_INFO_ACTION

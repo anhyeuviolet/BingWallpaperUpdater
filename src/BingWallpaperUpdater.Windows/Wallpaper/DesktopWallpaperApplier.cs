@@ -31,7 +31,8 @@ public sealed unsafe partial class DesktopWallpaperApplier : IWallpaperApplier
 {
     private const string MethodName = "com";
 
-    // CLSID_DesktopWallpaper {C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}; the CsWin32 DesktopWallpaper class keeps its copy private.
+    // CLSID_DesktopWallpaper {C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}; the CsWin32 DesktopWallpaper class is deliberately
+    // not generated (NativeMethods.txt, IN-13), so the CLSID lives here.
     private static readonly Guid ClsidDesktopWallpaper = new(0xC2CF3110, 0x460E, 0x4FC1, 0xB9, 0xD0, 0x8A, 0x1C, 0x0C, 0x9C, 0xC4, 0xBD);
 
     public ApplyResult Apply(string absolutePath)
@@ -225,14 +226,15 @@ public sealed unsafe partial class DesktopWallpaperApplier : IWallpaperApplier
 
     /// <summary>
     /// One <c>IDesktopWallpaper</c> proxy for one operation (WR-02). The CsWin32 <c>DesktopWallpaper.CreateInstance</c>
-    /// helper marshals through <see cref="ComInterfaceMarshaller{T}"/>, i.e. the shared ComWrappers cache, whose RCW
-    /// drops its COM reference only from the finalizer thread — so proxies piled up between ticks under the
-    /// non-concurrent GC. Activating through the raw <c>CoCreateInstance</c> and
-    /// <see cref="UniqueComInterfaceMarshaller{T}"/> yields a unique-instance <see cref="ComObject"/>, the only kind
-    /// <see cref="ComObject.FinalRelease"/> acts on, so <see cref="Release"/> can drop the reference deterministically
-    /// on the calling STA thread. Throws the same types the CsWin32 helper threw (<c>Marshal.ThrowExceptionForHR</c>
-    /// mapping; <see cref="InvalidCastException"/> when the interface is not implemented), so the callers'
-    /// <see cref="ComFailure.IsActivationFailure"/> filters are unchanged.
+    /// helper (no longer generated — it and <c>PInvoke.CoCreateInstance</c> are left out of <c>NativeMethods.txt</c>
+    /// so this stays the only activation path, IN-13) marshalled through <see cref="ComInterfaceMarshaller{T}"/>,
+    /// i.e. the shared ComWrappers cache, whose RCW drops its COM reference only from the finalizer thread — so
+    /// proxies piled up between ticks under the non-concurrent GC. Activating through the raw
+    /// <c>CoCreateInstance</c> and <see cref="UniqueComInterfaceMarshaller{T}"/> yields a unique-instance
+    /// <see cref="ComObject"/>, the only kind <see cref="ComObject.FinalRelease"/> acts on, so <see cref="Release"/>
+    /// can drop the reference deterministically on the calling STA thread. Throws the same types the CsWin32 helper
+    /// threw (<c>Marshal.ThrowExceptionForHR</c> mapping; <see cref="InvalidCastException"/> when the interface is
+    /// not implemented), so the callers' <see cref="ComFailure.IsActivationFailure"/> filters are unchanged.
     /// </summary>
     private static IDesktopWallpaper Activate()
     {
