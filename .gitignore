@@ -3,12 +3,12 @@ bin/
 obj/
 publish/
 dist/
+TestResults/
 build.log
 
 # IDE / user state
 *.user
 .vs/
-
 # GSD session-local files
 .gsd/
 .planning/milestone.lock

@@ -1,0 +1,153 @@
+# Release workflow (Phase 4, Plan 03; REL-01, REL-03).
+#
+# ROADMAP success criterion 1: a version tag is tested, built and attached with its SHA-256 to a GitHub
+# Release, and the same installer builds on every push to master and every pull request (artifact only,
+# no release). One `build` job does everything on both trigger paths; the `release` job runs only on a
+# `v<X.Y.Z>` tag and creates a DRAFT release, so the maintainer writes the notes by hand before anything
+# becomes public (REL-03).
+#
+# Runner: `windows-2025` pinned by label (Image Version 20260913.261.1 at planning time) - never the
+# floating "latest" label, which moves under the workflow. The .NET SDK is restored from global.json
+# through actions/setup-dotnet even though the image ships it, and Inno Setup 6.7.1 is installed
+# explicitly through Chocolatey even though the image ships 6.7.1 today: the image can drift to Inno 7
+# (different install folder, different CLI) and the build must keep producing the same installer.
+#
+# Secrets: none. The only token is the automatic GITHUB_TOKEN; the top level is contents: read, only the
+# tag-gated `release` job asks for contents: write, and the id-token / attestations write scopes on the
+# build job serve the provenance step alone, which runs only for a tag on a public repository.
+#
+# The version flows once: tag vX.Y.Z -> X.Y.Z (any other tag shape fails the run), pushes and pull
+# requests build 0.0.0; tools/build-installer.ps1 stamps it into the assemblies and the installer name.
+# Action majors are pinned (v7 / v6 / v7 / v8 / v3 / v4); SHA pinning is a recorded follow-up.
+
+name: release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up .NET SDK from global.json
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Resolve version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
+              Write-Error "Tag '$env:REF_NAME' is not of the form v<X.Y.Z>; refusing to build a release from it."
+              exit 1
+            }
+            $version = $env:REF_NAME.Substring(1)
+          } else {
+            $version = '0.0.0'
+          }
+          Write-Host "APP_VERSION=$version (ref_type=$env:REF_TYPE ref_name=$env:REF_NAME)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION=$version"
+
+      - name: Test (Core)
+        run: |
+          dotnet test tests/BingWallpaperUpdater.Core.Tests -c Release --logger trx --results-directory TestResults
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install Inno Setup 6.7.1
+        run: |
+          choco install innosetup --version=6.7.1 -y --no-progress
+          $chocoExit = $LASTEXITCODE
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if ($chocoExit -ne 0) {
+            if (-not (Test-Path -LiteralPath $iscc)) {
+              Write-Error "choco install innosetup exited $chocoExit and no ISCC.exe exists at $iscc"
+              exit 1
+            }
+            Write-Warning "choco install innosetup exited $chocoExit; using the preinstalled copy at $iscc"
+          }
+          if (Test-Path -LiteralPath $iscc) {
+            $ver = (Get-Item -LiteralPath $iscc).VersionInfo.ProductVersion
+            Write-Host "ISCC.exe present at $iscc (ProductVersion $ver)"
+          }
+
+      - name: Publish and compile the installer
+        run: |
+          & ./tools/build-installer.ps1 -Version $env:APP_VERSION 6>&1 | Tee-Object -Variable buildOut
+          $exit = $LASTEXITCODE
+          $text = ($buildOut | Out-String)
+          if ($exit -ne 0 -or $text -notmatch 'BUILD-INSTALLER OK') {
+            Write-Error "tools/build-installer.ps1 failed (exit $exit) or did not print BUILD-INSTALLER OK"
+            exit 1
+          }
+
+      - name: Write SHA-256 checksum
+        run: |
+          & ./tools/checksum.ps1 -Dir dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify checksum with sha256sum
+        shell: bash
+        run: |
+          cd dist && sha256sum -c *.sha256
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: BingWallpaperUpdater-${{ env.APP_VERSION }}-x64-Setup
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attest build provenance (tag on a public repository only)
+        if: github.ref_type == 'tag' && github.event.repository.private == false
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.exe
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: BingWallpaperUpdater-${{ needs.build.outputs.version }}-x64-Setup
+          path: dist
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          name: BingWallpaperUpdater ${{ needs.build.outputs.version }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          files: |
+            dist/*.exe
+            dist/*.sha256

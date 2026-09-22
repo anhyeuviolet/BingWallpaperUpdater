@@ -457,7 +457,10 @@ public sealed class CatalogServiceTests : IDisposable
             string? ua = r.Header("User-Agent");
             Assert.NotNull(ua);
             Assert.StartsWith("BingWallpaperUpdater/", ua, StringComparison.Ordinal);
-            Assert.True(ProductInfoHeaderValue.TryParse(ua.Split(' ')[0], out _));
+            // RecordedRequest joins the product and the "(+<repo>)" comment with ", "; parse the product alone.
+            string product = ua.Split([' ', ','], StringSplitOptions.RemoveEmptyEntries)[0];
+            Assert.True(ProductInfoHeaderValue.TryParse(product, out _));
+            Assert.Contains("(+https://github.com/anhyeuviolet/BingWallpaperUpdater)", ua, StringComparison.Ordinal);
         });
     }
 }

@@ -17,8 +17,13 @@
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <SatelliteResourceLanguages>en;vi</SatelliteResourceLanguages>
     <Version>0.1.0</Version>
-    <!-- Filled in Phase 4 once the public repository exists; consumed by the HTTP User-Agent. -->
-    <RepositoryUrl></RepositoryUrl>
+    <!--
+      Filled in Phase 4 (Plan 04-03). Lands in the generated AssemblyInfo as the RepositoryUrl assembly
+      metadata and is consumed by HttpGateway.DefaultUserAgent() as the "(+<repo>)" suffix, so the
+      User-Agent reads "BingWallpaperUpdater/<ver> (+https://github.com/anhyeuviolet/BingWallpaperUpdater)".
+      <Version> above is the local default; CI overrides it through tools/build-installer.ps1 -Version.
+    -->
+    <RepositoryUrl>https://github.com/anhyeuviolet/BingWallpaperUpdater</RepositoryUrl>
   </PropertyGroup>
 
 </Project>
