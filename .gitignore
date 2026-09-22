@@ -9,7 +9,7 @@ build.log
 # IDE / user state
 *.user
 .vs/
-# GSD session-local files
+# Local planning and assistant workspace - never published
 .gsd/
-.planning/milestone.lock
-.planning/research/.cache/
+.planning/
+.claude/
