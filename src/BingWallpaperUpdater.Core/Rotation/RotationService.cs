@@ -458,11 +458,16 @@ public sealed class RotationService : IDisposable
         Nudge("network");
     }
 
-    /// <summary>Test/diagnostic helper: completes once no tick holds the gate.</summary>
+    /// <summary>
+    /// Test/diagnostic helper: completes once no tick holds the gate. It briefly owns the gate itself, so — like
+    /// every other holder — it runs <see cref="ReapplyIfPending"/> after its release: a re-apply whose
+    /// <c>Wait(0)</c> landed inside that window is dispatched now instead of waiting for the next holder (IN-12).
+    /// </summary>
     public async Task WaitForIdleAsync(CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         _gate.Release();
+        ReapplyIfPending();
     }
 
     /// <summary>Stops the heartbeat; later <see cref="RunTickAsync"/> calls return <see cref="TickResult.Cancelled"/>. Does not wait for an in-flight tick (RESEARCH Pitfall 9).</summary>
