@@ -22,6 +22,14 @@ internal static class Program
     /// </summary>
     private const string ShowEventName = @"Local\BingWallpaperUpdater.Show";
 
+    /// <summary>
+    /// "Exit" signal, session-scoped like the mutex and the Show event: <c>installer/setup.iss</c> (<c>RequestAppExit</c>,
+    /// run by both Setup and the uninstaller) sets it before touching the install folder, and the primary instance ends
+    /// through the single <see cref="TrayApplicationContext.Shutdown"/> funnel with reason <c>exit-signal</c>. Same trust
+    /// boundary as the Show event (any same-user, same-session process may set it; the effect is a clean exit).
+    /// </summary>
+    private const string ExitEventName = @"Local\BingWallpaperUpdater.Exit";
+
     /// <summary>Autostart flag in the HKCU Run value (D-12, INST-02); the parser and the producer share one literal. Matched case-insensitively, no value.</summary>
     private const string StartupFlag = AutostartCommand.Flag;
 
@@ -47,6 +55,8 @@ internal static class Program
         // Created right after the mutex (Pitfall 12) so a second launch during startup finds it; owned here for the
         // process lifetime — the context registers a wait on it but never disposes it.
         using var showEvent = new EventWaitHandle(initialState: false, EventResetMode.AutoReset, ShowEventName, out _);
+        // The installer's exit signal, same ownership rule; a second launch never sets it (only the Show event above).
+        using var exitEvent = new EventWaitHandle(initialState: false, EventResetMode.AutoReset, ExitEventName, out _);
 
         AppPaths.EnsureDirectories();
         Log.Initialize(AppPaths.LogPath);
@@ -85,7 +95,7 @@ internal static class Program
         bool startup = args.Any(a => string.Equals(a, StartupFlag, StringComparison.OrdinalIgnoreCase));
 
         Log.Info($"startup version={InformationalVersion()} pid={Environment.ProcessId}");
-        context = new TrayApplicationContext(settings, showEvent, startup);
+        context = new TrayApplicationContext(settings, showEvent, exitEvent, startup);
         Application.Run(context);
         return 0;
     }

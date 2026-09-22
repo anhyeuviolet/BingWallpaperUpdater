@@ -34,9 +34,11 @@ namespace BingWallpaperUpdater.App;
 /// to <see cref="RotationService.OnNetworkAvailable"/>, and <see cref="SystemEvents.DisplaySettingsChanged"/> to
 /// <see cref="RotationService.OnDisplayChanged"/> (a 3 s debounce, then a gated per-monitor re-apply only when the
 /// attached set changed — WALL-03; never a tick). Those handlers run on system-events / thread-pool threads and touch
-/// nothing but the thread-safe service methods and <see cref="Log"/>; the Show-event wait posts to the UI thread.
-/// Every exit path (Exit menu, thread/unhandled exception, session ending) funnels through <see cref="Shutdown"/>,
-/// which logs once and disposes in a fixed order: unsubscribe the static events and the Show wait, cancel the token,
+/// nothing but the thread-safe service methods and <see cref="Log"/>; the Show-event and Exit-event waits post to the
+/// UI thread.
+/// Every exit path (Exit menu, thread/unhandled exception, session ending, the installer's
+/// <c>Local\BingWallpaperUpdater.Exit</c> event on upgrade or uninstall) funnels through <see cref="Shutdown"/>,
+/// which logs once and disposes in a fixed order: unsubscribe the static events and the Show and Exit waits, cancel the token,
 /// stop the heartbeat, unregister and destroy the power window, dispose the window, hide and dispose the icon,
 /// dispose the gateway, then the token source; an in-flight tick is not awaited (its state/index writes are atomic;
 /// process exit ends it). <see cref="Dispose(bool)"/> is idempotent because WinForms disposes the context again when
@@ -60,17 +62,20 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly RotationService _rotation;
     private readonly PowerWindow _powerWindow;
     private readonly RegisteredWaitHandle? _showWait;
+    private readonly RegisteredWaitHandle? _exitWait;
     private SettingsForm? _settingsForm;
     private int _shutdownRequested;
     private bool _disposed;
 
     /// <param name="settings">The instance loaded by <c>Main</c>; shared with the service and the window (D-09).</param>
     /// <param name="showEvent">The <c>Local\BingWallpaperUpdater.Show</c> event owned by <c>Main</c>; a set opens or activates Settings.</param>
+    /// <param name="exitEvent">The <c>Local\BingWallpaperUpdater.Exit</c> event owned by <c>Main</c>; a set (installer upgrade / uninstall) ends the app through <see cref="Shutdown"/>.</param>
     /// <param name="startup">True when launched with <c>--startup</c>: the first tick waits 30-60 s (D-12).</param>
-    public TrayApplicationContext(Settings settings, EventWaitHandle showEvent, bool startup)
+    public TrayApplicationContext(Settings settings, EventWaitHandle showEvent, EventWaitHandle exitEvent, bool startup)
     {
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(showEvent);
+        ArgumentNullException.ThrowIfNull(exitEvent);
         _settings = settings;
 
         // The menu and icon come first: creating the first WinForms control is what installs the
@@ -147,6 +152,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // UI-06: a second launch sets the event from its own process; the wait callback runs on a thread-pool thread
         // and posts ShowSettings to the UI thread. The event is owned by Main and never disposed here.
         _showWait = ThreadPool.RegisterWaitForSingleObject(showEvent, (_, _) => ui.Post(_ => ShowSettings(), null), null, Timeout.Infinite, executeOnlyOnce: false);
+
+        // Installer upgrade / uninstall path (installer/setup.iss RequestAppExit): the signal is posted to the UI thread
+        // so Shutdown and Dispose run where the icon lives; once is enough because the process ends. Owned by Main.
+        _exitWait = ThreadPool.RegisterWaitForSingleObject(exitEvent, (_, _) => ui.Post(_ => Shutdown("exit-signal"), null), null, Timeout.Infinite, executeOnlyOnce: true);
 
         // Secondary bridges (RESEARCH Pattern 6). Each handler lives in a field so Dispose can unsubscribe it; each
         // only calls a thread-safe RotationService method or Log — never the icon or the menu.
@@ -250,6 +259,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             SystemEvents.DisplaySettingsChanged -= _displayChanged;
             NetworkChange.NetworkAvailabilityChanged -= _networkChanged;
             _showWait?.Unregister(null);
+            _exitWait?.Unregister(null);
             _cts.Cancel();
             _rotation.Dispose();
             _powerWindow.Dispose();
