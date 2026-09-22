@@ -10,8 +10,12 @@
 #      at once without activation (ShowWindow SW_SHOWMINNOACTIVE, so the focus goes straight back to whatever the user
 #      was in), Process.CloseMainWindow closes it; the "settings window action=open/close" log lines are awaited; a
 #      sample after every fifth cycle. The burst takes ~40 s; -NoSettingsCycles skips it entirely;
-#   4. -Ticks (200) rotation ticks: the Settings window is opened once, minimized without activation, and its "Next
-#      wallpaper" button (AutomationId NextButton) is invoked through UI Automation; every click is one real tick
+#   4. -Ticks (200) rotation ticks: the Settings window is opened once, the HWND of its "Next wallpaper" button
+#      (AutomationId NextButton) is read through UI Automation while the window is still visible, then the window is
+#      minimized without activation and every tick is a WM_COMMAND/BN_CLICKED posted to the form with that button HWND
+#      - WinForms reflects it to the Button's Click handler with no mouse input, no focus change and no visible window
+#      (a minimized window has no UI Automation subtree and restoring one activates it, so UIA cannot click here);
+#      every click is one real tick
 #      (catalog check, Bing API, COM apply, backfill) and the tool waits for the "tick done" log line before the next
 #      one; samples every -SampleIntervalSeconds carry the tick index they were taken after; then the window is closed
 #      and a post-ticks sample is taken;
@@ -381,10 +385,17 @@ Write-Host "CSV: $Csv (os=$($osInfo.Caption) $($osInfo.Version) app=$appVersion 
 # ---- 3. sampling -----------------------------------------------------------------------------------------
 
 Add-Type -Namespace W -Name G -MemberDefinition '[DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);'
-Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'
+Add-Type -Namespace W -Name U -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+'@
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $SW_SHOWMINNOACTIVE = 7
+$WM_COMMAND = 0x0111   # wParam LOWORD = control id (0), HIWORD = BN_CLICKED (0); lParam = the button's HWND
+$script:nextHwnd = [IntPtr]::Zero
 
 # One-line ETA so the maintainer knows how long to stay away from the machine: measured tick ~0.5 s (up to ~1.5 s
 # while the backfill downloads), cycle ~1.5 s, plus the 5 s post-ticks and 20 s final settles.
@@ -439,7 +450,7 @@ function Wait-Window([System.Diagnostics.Process]$p, [bool]$open, [int]$timeoutS
     return $false
 }
 
-function Open-Settings([System.Diagnostics.Process]$p, [string]$what) {
+function Open-Settings([System.Diagnostics.Process]$p, [string]$what, [bool]$findNext = $false) {
     $skip = @(Read-Log).Count
     try {
         $evt = [System.Threading.EventWaitHandle]::OpenExisting($showEventName)
@@ -447,10 +458,25 @@ function Open-Settings([System.Diagnostics.Process]$p, [string]$what) {
         $evt.Dispose()
     } catch { Fail "cannot signal $showEventName ($what): $($_.Exception.Message)" }
     if (-not (Wait-Window $p $true 15)) { Fail "no main window within 15 s after the Show signal ($what)" }
-    # Give the focus back at once: minimize without activation, so the foreground window the user was in regains
-    # the input. The form stays alive and minimized (MainWindowHandle stays non-zero; UI Automation still reaches it).
     $p.Refresh()
-    [W.U]::ShowWindow($p.MainWindowHandle, $SW_SHOWMINNOACTIVE) | Out-Null
+    $hwnd = $p.MainWindowHandle
+    if ($findNext) {
+        # The window is visible (Form.Show does not take the foreground from another process) but a minimized window
+        # exposes no UI Automation subtree, so the Next button's own HWND is captured now, before minimizing.
+        $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'NextButton')
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline -and $script:nextHwnd -eq [IntPtr]::Zero) {
+            $button = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd).FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            if ($null -ne $button -and $button.Current.NativeWindowHandle -ne 0) { $script:nextHwnd = [IntPtr]$button.Current.NativeWindowHandle }
+            else { Start-Sleep -Milliseconds 100 }
+        }
+        if ($script:nextHwnd -eq [IntPtr]::Zero) { Fail "NextButton not found on the Settings window (UI Automation, $what)" }
+    }
+    # Give the focus back at once: minimize without activation, so whatever the user was in keeps the input. The form
+    # stays alive and minimized (MainWindowHandle stays non-zero) and its child HWNDs keep working.
+    [W.U]::ShowWindow($hwnd, $SW_SHOWMINNOACTIVE) | Out-Null
+    Start-Sleep -Milliseconds 100
+    if ([W.U]::GetForegroundWindow() -eq $hwnd) { Fail "the Settings window holds the focus after being minimized ($what)" }
     $openLine = Wait-LogLine -Pattern ([regex]::Escape($openToken)) -SkipLines $skip -Timeout 15 -Process $p
     if (-not $openLine) { Fail "no '$openToken' log line ($what)" }
 }
@@ -480,20 +506,22 @@ Get-Sample $proc 'post-settings' 0 $SettingsCycles | Out-Null
 # ---- 5. rotation ticks through the Next button (UI Automation) --------------------------------------------
 
 if ($Ticks -gt 0) {
-    Open-Settings $proc 'ticks'
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($proc.MainWindowHandle)
-    $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'NextButton')
-    $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
-    if ($null -eq $button) { Fail 'NextButton not found on the Settings window (UI Automation)' }
+    Open-Settings $proc 'ticks' $true
+    $formHwnd = $proc.MainWindowHandle
+    Write-Host ('Next button hwnd=0x{0:X} (window minimized, clicks are posted as WM_COMMAND/BN_CLICKED to the form)' -f $script:nextHwnd.ToInt64())
     $lastSample = [DateTime]::UtcNow
     for ($t = 1; $t -le $Ticks; $t++) {
+        # The app disables the button while a tick runs (D-05); IsWindowEnabled mirrors Control.Enabled.
         $deadline = (Get-Date).AddSeconds(30)
-        while ((Get-Date) -lt $deadline -and -not $button.Current.IsEnabled) { Start-Sleep -Milliseconds 50 }
-        if (-not $button.Current.IsEnabled) { Fail "the Next button stayed disabled for 30 s before tick $t" }
+        while ((Get-Date) -lt $deadline -and -not [W.U]::IsWindowEnabled($script:nextHwnd)) { Start-Sleep -Milliseconds 50 }
+        if (-not [W.U]::IsWindowEnabled($script:nextHwnd)) { Fail "the Next button stayed disabled for 30 s before tick $t" }
         $skip = @(Read-Log).Count
-        try { $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch { Fail "Invoke on NextButton failed (tick $t): $($_.Exception.Message)" }
+        # WM_COMMAND with the button HWND in lParam is reflected by WinForms to that Button, which raises Click - the
+        # same path a real BN_CLICKED takes, with no mouse input, no focus change and no visible window.
+        if (-not [W.U]::PostMessage($formHwnd, $WM_COMMAND, [IntPtr]::Zero, $script:nextHwnd)) { Fail "PostMessage WM_COMMAND failed (tick $t)" }
         $tickLine = Wait-LogLine -Pattern $tickPattern -SkipLines $skip -Timeout 90 -Process $proc
         if (-not $tickLine) { Fail "no 'tick done' log line within 90 s after Next (tick $t)" }
+        if ($t -le 3 -and [W.U]::GetForegroundWindow() -eq $formHwnd) { Fail "the Settings window took the focus after the Next click (tick $t)" }
         if ($t % 10 -eq 0 -or $t -eq $Ticks) { Write-Host "tick $t/$Ticks : $tickLine" }
         if ($t -eq $Ticks -or ([DateTime]::UtcNow - $lastSample).TotalSeconds -ge $SampleIntervalSeconds) {
             Get-Sample $proc 'ticks' $t $SettingsCycles | Out-Null

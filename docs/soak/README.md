@@ -33,10 +33,14 @@ quarter of an hour instead of waiting a day for 48 natural ticks:
    sample after every fifth cycle, `post-settings` at the end (window closed). Each opened window is minimized at once
    without activation (`ShowWindow SW_SHOWMINNOACTIVE`) so the focus returns to whatever was in front; the burst
    takes about 40 s. `-NoSettingsCycles` skips it.
-4. `-Ticks` (200) rotation ticks: the Settings window is opened once, minimized without activation, and its
-   **Next wallpaper** button is invoked through UI Automation (`AutomationId` = `NextButton`). Each click is one real
+4. `-Ticks` (200) rotation ticks: the Settings window is opened once, the HWND of its **Next wallpaper** button is
+   read through UI Automation (`AutomationId` = `NextButton`) while the window is still visible, then the window is
+   minimized without activation and every tick is a `WM_COMMAND`/`BN_CLICKED` posted to the form with that button
+   HWND - WinForms reflects it to the button's `Click` handler with no mouse input, no focus change and no visible
+   window (a minimized window has no UI Automation subtree, and restoring one activates it). Each click is one real
    tick - catalog check on GitHub (304), Bing API, COM wallpaper apply, one backfill download until the cache is full -
-   and the tool waits for the `tick done` log line before the next click (`-TickGapSec`, 1 s, between clicks). A
+   and the tool waits for the `tick done` log line before the next click (`-TickGapSec`, 1 s, between clicks). The tool
+   fails the run if the Settings window ever holds the foreground after being minimized or after a click. A
    `ticks` sample is taken every `-SampleIntervalSeconds` (15) right after a tick completes, carrying that tick's index.
    Then the window is closed and a `post-ticks` sample is taken.
 5. `final` sample after a 20 s settle with the window closed, verdict, `<csv>.result.txt`.
