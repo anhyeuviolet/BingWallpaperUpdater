@@ -253,7 +253,10 @@ public sealed class RotationService : IDisposable
     /// </summary>
     private void ReapplyIfPending()
     {
-        if (_disposed)
+        // Shutdown cancels the token before Dispose runs (TrayApplicationContext.Shutdown), so a tick cancelled at
+        // shutdown reaches this finally with _disposed still false: without the token check it would dispatch a
+        // re-apply whose UI hop the dispatcher cancels at once, logged as a failure (IN-10).
+        if (_disposed || _ct.IsCancellationRequested)
         {
             return;
         }
@@ -943,6 +946,11 @@ public sealed class RotationService : IDisposable
 
                 applied = true;
             }
+        }
+        catch (OperationCanceledException) when (_ct.IsCancellationRequested)
+        {
+            // Shutdown cancelled the UI hop: not a failure, the desktop is left as it is (IN-10).
+            Log.Info($"reapply cancelled reason={reason}");
         }
         catch (Exception ex)
         {
