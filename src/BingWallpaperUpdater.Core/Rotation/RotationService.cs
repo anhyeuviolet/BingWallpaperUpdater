@@ -46,6 +46,9 @@ public sealed class RotationService : IDisposable
     // 5 min and the persisted NextDueUtc always means the schedule, never a backoff. Both guarded by _sync.
     private DateTimeOffset? _retryDueUtc;   // in-memory backoff due time; null when no retry is pending
     private int _failureStage;               // 0 after any successful fetch; +1 per failed fetch
+    // Catalog IDs whose backfill download was rejected in this process (CDN 404 placeholder, bad dimensions): never
+    // persisted, so a restart retries each once (CACHE-06). Tick-only access under the single-flight gate, so no lock.
+    private readonly HashSet<string> _backfillSkip = new(StringComparer.Ordinal);
     private int _appliedIntervalMinutes;     // the interval the current NextDueUtc was computed with (ApplySettings, D-07)
     private LastErrorKind _lastError;        // what the last tick left for the window's last-error line (UI-04); guarded by _sync
     private string[] _lastAttachedSet = [];  // sorted device paths of the monitors the last SUCCESSFUL apply set (WALL-03, WR-04); UI thread only, never persisted
@@ -578,8 +581,15 @@ public sealed class RotationService : IDisposable
 
         try
         {
-            // 1. fetch — one conditional GET per tick (D-02); null means neither source produced a row (Pitfall 5).
-            CatalogEntry? entry = await _catalog.GetNewestAsync(_settings.Market, ct).ConfigureAwait(false);
+            // 1. fetch — one conditional GET per tick (D-02); the full list (newest first) is read because step 4b
+            // backfills from the same rows (CACHE-06); an empty list means neither source produced a row (Pitfall 5).
+            IReadOnlyList<CatalogEntry> rows = await _catalog.GetCatalogAsync(_settings.Market, ct).ConfigureAwait(false);
+            CatalogEntry? entry = rows.Count > 0 ? rows[0] : null;
+            if (entry is null)
+            {
+                Log.Warn("pipeline failed stage=catalog error=no catalog source produced rows");
+            }
+
             lock (_sync)
             {
                 _state.LastCheckUtc = now;   // a 24-byte DateTimeOffset?: never torn by a concurrent save (WR-03)
@@ -662,6 +672,14 @@ public sealed class RotationService : IDisposable
 
                 result = apply.Ok ? TickResult.Applied : TickResult.ApplyFailed;
             }
+
+            // 4b. backfill (CACHE-06) — after the apply, never before it; only on a tick whose fetch and newest ensure
+            // both succeeded (never offline, never after a throw); at most one download. Its own try/catch inside
+            // BackfillOneAsync keeps a backfill failure out of the ladder, the schedule and the tick result.
+            if (!fetchFailed && !threw)
+            {
+                await BackfillOneAsync(rows, resolution, ct).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -743,6 +761,59 @@ public sealed class RotationService : IDisposable
         TrySaveState();
         Log.Info($"tick done reason={reason} result={result} decision={decision?.Kind.ToString() ?? "-"} why={decision?.Why ?? "-"} next={nextDue?.ToString("O") ?? "-"} retry={retryDue?.ToString("O") ?? "-"}");
         return result;
+    }
+
+    /// <summary>
+    /// Tick step 4b (CACHE-06): while the cache holds fewer than <see cref="ImageCache.MaxImages"/> validated images,
+    /// download exactly one older catalog image so that "Next" and random mode have material within days of install.
+    /// Runs only from a successful tick — one whose fetch produced rows and whose newest ensure did not fail — and
+    /// always after the apply, so the newest-image step is never delayed or replaced. The candidate is the newest row
+    /// (rows are newest first) that is neither cached with its file on disk for this tick's resolution nor in the
+    /// process-local <see cref="_backfillSkip"/> set; a rejected download retires its ID for the rest of the process
+    /// (a restart retries once) so one dead catalog ID never costs a request on every tick. <paramref name="resolution"/>
+    /// is the tick-local effective resolution (Auto never reaches here), so the backfill goes through the same
+    /// <see cref="ImageCache.EnsureAsync"/> pipeline as the newest image: host allow-list, JPEG validation, dimension
+    /// check and the 64 MB cap are unchanged. The cap check precedes any download because <see cref="ImageCache.Add"/>
+    /// evicts down to the cap and would otherwise churn the oldest image. Any failure only logs — it never writes the
+    /// tick flags, the D-13 ladder, the schedule or the result.
+    /// </summary>
+    private async Task BackfillOneAsync(IReadOnlyList<CatalogEntry> rows, string resolution, CancellationToken ct)
+    {
+        try
+        {
+            if (_cache.Index.Images.Count >= ImageCache.MaxImages)
+            {
+                Log.Info("backfill skipped cause=full");
+                return;
+            }
+
+            CatalogEntry? candidate = rows.FirstOrDefault(r =>
+                !_backfillSkip.Contains(r.Id.Value)
+                && (_cache.TryGet(r.Id, resolution) is not { } hit || !FileExists(hit)));
+            if (candidate is null)
+            {
+                Log.Info("backfill skipped cause=no-candidate");
+                return;
+            }
+
+            CachedImage? added = await _cache.EnsureAsync(candidate, resolution, _http, ct).ConfigureAwait(false);
+            if (added is null)
+            {
+                _backfillSkip.Add(candidate.Id.Value);
+                Log.Warn($"backfill failed id={candidate.Id}");
+                return;
+            }
+
+            Log.Info($"backfill id={added.Id} file={added.File} cached={_cache.Index.Images.Count}/{ImageCache.MaxImages}");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;   // only ct decides what counts as cancellation (WR-04); the tick's own catch rethrows it
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"backfill failed error={ex.Message}", ex);   // no flag writes: the ladder, schedule and result are untouched
+        }
     }
 
     private DateTimeOffset? ReadNextDue()
