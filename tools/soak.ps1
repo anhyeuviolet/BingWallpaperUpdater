@@ -6,13 +6,20 @@
 #
 #   1. launch publish\BingWallpaperUpdater.exe (or -NoLaunch: attach to the running instance), wait for the first tick;
 #   2. baseline sample with the window closed;
-#   3. -SettingsCycles (20) open/close cycles: Local\BingWallpaperUpdater.Show event opens the window, Process.CloseMainWindow
-#      closes it; the "settings window action=open/close" log lines are awaited; a sample after every fifth cycle;
-#   4. -Ticks (200) rotation ticks: the Settings window is opened once and its "Next wallpaper" button (AutomationId
-#      NextButton) is invoked through UI Automation; every click is one real tick (catalog check, Bing API, COM apply,
-#      backfill) and the tool waits for the "tick done" log line before the next one; samples every -SampleIntervalSeconds
-#      carry the tick index they were taken after; then the window is closed and a post-ticks sample is taken;
-#   5. final sample after a 30 s settle with the window closed, verdict, <csv>.result.txt.
+#   3. -SettingsCycles (20) open/close cycles: Local\BingWallpaperUpdater.Show event opens the window, it is minimized
+#      at once without activation (ShowWindow SW_SHOWMINNOACTIVE, so the focus goes straight back to whatever the user
+#      was in), Process.CloseMainWindow closes it; the "settings window action=open/close" log lines are awaited; a
+#      sample after every fifth cycle. The burst takes ~40 s; -NoSettingsCycles skips it entirely;
+#   4. -Ticks (200) rotation ticks: the Settings window is opened once, minimized without activation, and its "Next
+#      wallpaper" button (AutomationId NextButton) is invoked through UI Automation; every click is one real tick
+#      (catalog check, Bing API, COM apply, backfill) and the tool waits for the "tick done" log line before the next
+#      one; samples every -SampleIntervalSeconds carry the tick index they were taken after; then the window is closed
+#      and a post-ticks sample is taken;
+#   5. final sample after a 20 s settle with the window closed, verdict, <csv>.result.txt.
+#
+# The whole default run takes about 7 minutes (an ETA line is printed at start). The Settings window still appears for
+# a fraction of a second per cycle before it is minimized and the wallpaper changes on every tick, so run it when you
+# are away from the machine.
 #
 # Every sample is one CSV row with the numbers Task Manager and Process Explorer show:
 #   PrivateWS_MB  private working set = Task Manager's "Memory" column (Win32_PerfFormattedData_PerfProc_Process.WorkingSetPrivate)
@@ -42,8 +49,8 @@
 #                      running instance, launch publish\BingWallpaperUpdater.exe, wait for the first tick, stop it at the end.
 #   -FreshData         (launch mode only) delete %LocalAppData%\BingWallpaperUpdater first so the run starts from an
 #                      install-like state: empty cache, first tick downloads, backfill fills the cache during the ticks.
-#   -Ticks 200         rotation ticks driven through the Next button; -TickGapSec 3 seconds between ticks.
-#   -SettingsCycles 20 Settings window open/close cycles; -CycleGapSec 5 seconds between cycles.
+#   -Ticks 200         rotation ticks driven through the Next button; -TickGapSec 1 second between ticks.
+#   -SettingsCycles 20 Settings window open/close cycles; -CycleGapSec 1 second between cycles; -NoSettingsCycles = 0.
 #   -SampleIntervalSeconds 15   sampling cadence during the ticks phase (a sample is taken right after a tick completes).
 #   -Csv <path>        output file (default docs\soak\soak-<yyyyMMdd-HHmm>.csv under the repo).
 #   -BudgetMB 100, -SlopeWarnKBPerTick 8, -HandleGrowthWarn 100, -GdiGrowthWarn 50, -UserGrowthWarn 50   thresholds.
@@ -54,21 +61,22 @@
 # process other than BingWallpaperUpdater, and deletes nothing outside the app data folder (T-04-20 .. T-04-22).
 #
 #   dotnet publish src/BingWallpaperUpdater.App -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o publish
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -FreshData -Ticks 10 -SettingsCycles 3 -TickGapSec 1 -CycleGapSec 1 -SampleIntervalSeconds 5 -Csv "$env:TEMP\bwu-soak-short.csv"
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -FreshData -Ticks 10 -SettingsCycles 3 -SampleIntervalSeconds 5 -Csv "$env:TEMP\bwu-soak-short.csv"
 #
-# The run behind the README figure (Windows 11, this repo's publish\ build):
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -FreshData -Ticks 200 -SettingsCycles 20 -Csv docs\soak\win11-soak.csv
+# The run behind the README figure (Windows 11, this repo's publish\ build; ~7 min, run it while away from the machine):
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -FreshData -Csv docs\soak\win11-soak.csv
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -Summarize docs\soak\win11-soak.csv
 # On a bare Windows 10 1809 VM with the installed build (no repo needed, the script attaches to the running app):
-#   powershell -NoProfile -ExecutionPolicy Bypass -File soak.ps1 -NoLaunch -Ticks 200 -SettingsCycles 20 -Csv win10-1809-soak.csv
+#   powershell -NoProfile -ExecutionPolicy Bypass -File soak.ps1 -NoLaunch -Csv win10-1809-soak.csv
 
 param(
     [switch]$NoLaunch,
     [switch]$FreshData,
+    [switch]$NoSettingsCycles,
     [int]$Ticks = 200,
     [int]$SettingsCycles = 20,
-    [int]$TickGapSec = 3,
-    [int]$CycleGapSec = 5,
+    [int]$TickGapSec = 1,
+    [int]$CycleGapSec = 1,
     [int]$SampleIntervalSeconds = 15,
     [string]$Csv = '',
     [int]$BudgetMB = 100,
@@ -81,6 +89,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($NoSettingsCycles) { $SettingsCycles = 0 }
 
 $repoRoot  = Split-Path -Parent $PSScriptRoot
 $exePath   = Join-Path $repoRoot 'publish\BingWallpaperUpdater.exe'
@@ -371,8 +381,15 @@ Write-Host "CSV: $Csv (os=$($osInfo.Caption) $($osInfo.Version) app=$appVersion 
 # ---- 3. sampling -----------------------------------------------------------------------------------------
 
 Add-Type -Namespace W -Name G -MemberDefinition '[DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);'
+Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+$SW_SHOWMINNOACTIVE = 7
+
+# One-line ETA so the maintainer knows how long to stay away from the machine: measured tick ~0.5 s (up to ~1.5 s
+# while the backfill downloads), cycle ~1.5 s, plus the 5 s post-ticks and 20 s final settles.
+$etaSec = [int]($SettingsCycles * (1.5 + $CycleGapSec) + $Ticks * (0.6 + $TickGapSec) + 8 * 1.0 + 25)
+Write-Host ('ETA: about {0} min ({1} Settings cycles + {2} ticks at {3} s gap); the Settings window flashes briefly per cycle and is minimized without focus while the ticks run' -f [math]::Ceiling($etaSec / 60), $SettingsCycles, $Ticks, $TickGapSec)
 
 function Get-Sample([System.Diagnostics.Process]$p, [string]$phase, [int]$tickIndex, [int]$cycles) {
     if ($p.HasExited) { Fail "the app exited (code $($p.ExitCode)) during phase $phase" }
@@ -430,6 +447,10 @@ function Open-Settings([System.Diagnostics.Process]$p, [string]$what) {
         $evt.Dispose()
     } catch { Fail "cannot signal $showEventName ($what): $($_.Exception.Message)" }
     if (-not (Wait-Window $p $true 15)) { Fail "no main window within 15 s after the Show signal ($what)" }
+    # Give the focus back at once: minimize without activation, so the foreground window the user was in regains
+    # the input. The form stays alive and minimized (MainWindowHandle stays non-zero; UI Automation still reaches it).
+    $p.Refresh()
+    [W.U]::ShowWindow($p.MainWindowHandle, $SW_SHOWMINNOACTIVE) | Out-Null
     $openLine = Wait-LogLine -Pattern ([regex]::Escape($openToken)) -SkipLines $skip -Timeout 15 -Process $p
     if (-not $openLine) { Fail "no '$openToken' log line ($what)" }
 }
@@ -448,7 +469,7 @@ Get-Sample $proc 'baseline' 0 0 | Out-Null
 
 for ($i = 1; $i -le $SettingsCycles; $i++) {
     Open-Settings $proc "cycle $i"
-    Start-Sleep -Seconds 2
+    Start-Sleep -Milliseconds 500
     Close-Settings $proc "cycle $i"
     Write-Host "settings cycle $i/$SettingsCycles done"
     if ($i % 5 -eq 0 -and $i -lt $SettingsCycles) { Get-Sample $proc 'settings' 0 $i | Out-Null }
@@ -487,7 +508,7 @@ if ($Ticks -gt 0) {
 
 # ---- 6. final sample after a settle, verdict ---------------------------------------------------------------
 
-Start-Sleep -Seconds 30
+Start-Sleep -Seconds 20
 Get-Sample $proc 'final' $Ticks $SettingsCycles | Out-Null
 
 $verdict = Get-Verdict $script:rows

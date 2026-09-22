@@ -30,26 +30,32 @@ quarter of an hour instead of waiting a day for 48 natural ticks:
 2. `baseline` sample with the window closed.
 3. `-SettingsCycles` (20) open/close cycles through the `Local\BingWallpaperUpdater.Show` event and
    `Process.CloseMainWindow`, waiting for the `settings window action=open` / `action=close` log lines; a `settings`
-   sample after every fifth cycle, `post-settings` at the end (window closed).
-4. `-Ticks` (200) rotation ticks: the Settings window is opened once and its **Next wallpaper** button is invoked
-   through UI Automation (`AutomationId` = `NextButton`). Each click is one real tick - catalog check on GitHub (304),
-   Bing API, COM wallpaper apply, one backfill download until the cache is full - and the tool waits for the `tick done`
-   log line before the next click. A `ticks` sample is taken every `-SampleIntervalSeconds` (15) right after a tick
-   completes, carrying that tick's index. Then the window is closed and a `post-ticks` sample is taken.
-5. `final` sample after a 30 s settle with the window closed, verdict, `<csv>.result.txt`.
+   sample after every fifth cycle, `post-settings` at the end (window closed). Each opened window is minimized at once
+   without activation (`ShowWindow SW_SHOWMINNOACTIVE`) so the focus returns to whatever was in front; the burst
+   takes about 40 s. `-NoSettingsCycles` skips it.
+4. `-Ticks` (200) rotation ticks: the Settings window is opened once, minimized without activation, and its
+   **Next wallpaper** button is invoked through UI Automation (`AutomationId` = `NextButton`). Each click is one real
+   tick - catalog check on GitHub (304), Bing API, COM wallpaper apply, one backfill download until the cache is full -
+   and the tool waits for the `tick done` log line before the next click (`-TickGapSec`, 1 s, between clicks). A
+   `ticks` sample is taken every `-SampleIntervalSeconds` (15) right after a tick completes, carrying that tick's index.
+   Then the window is closed and a `post-ticks` sample is taken.
+5. `final` sample after a 20 s settle with the window closed, verdict, `<csv>.result.txt`.
+
+The default run takes about 7 minutes; the tool prints an ETA line at start. The Settings window still flashes for a
+fraction of a second per cycle and the wallpaper changes on every tick, so run it while away from the machine.
 
 The command line behind `win11-soak.csv` (run from the repo root on Windows 11, `publish\` build of the named commit):
 
 ```powershell
 dotnet publish src/BingWallpaperUpdater.App -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o publish
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -FreshData -Ticks 200 -SettingsCycles 20 -Csv docs\soak\win11-soak.csv
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -FreshData -Csv docs\soak\win11-soak.csv
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/soak.ps1 -Summarize docs\soak\win11-soak.csv
 ```
 
 On a bare Windows 10 1809 VM with the installed build (copy only `tools\soak.ps1`; it attaches to the running app):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File soak.ps1 -NoLaunch -Ticks 200 -SettingsCycles 20 -Csv win10-1809-soak.csv
+powershell -NoProfile -ExecutionPolicy Bypass -File soak.ps1 -NoLaunch -Csv win10-1809-soak.csv
 ```
 
 ## Verdict and thresholds
@@ -76,7 +82,9 @@ difference is the warm HTTP stack, the WinForms assemblies and the cache index, 
 
 Header comments (`# key=value`): `os`, `build`, `appVersion`, `commit`, `startedUtc`, `interval`, `mode`, `resolution`,
 `monitorMode`, `cacheAtStart`, `ticks`, `settingsCycles`, `sampleIntervalSeconds`, `tickGapSec`, `cycleGapSec` -
-never the computer name, the user name or a profile path. Then the column header
+never the computer name, the user name or a profile path. The tool does not touch the registry: the app launched from
+`publish\` writes its own HKCU Run value on start (autostart defaults to on); clear it afterwards with
+`tools\autostart-probe.ps1 -Cleanup`, as the smoke does. Then the column header
 `Utc,ElapsedSec,Phase,TickIndex,CyclesDone,PrivateWS_MB,WS_MB,Commit_MB,Handles,Threads,GDI,USER,Window,CacheCount`
 and one row per sample, `Phase` = `baseline` | `settings` | `post-settings` | `ticks` | `post-ticks` | `final`.
 
