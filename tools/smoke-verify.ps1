@@ -1,11 +1,20 @@
-# Seventeen-scenario live smoke run for the Phase 3 contract (Phase 1 Plan 04 scenarios, updated by Phase 2 Plan 04
-# and extended by Phase 3 Plan 05).
+# Seventeen-scenario live smoke run for the Phase 3 contract (Phase 1 Plan 04 scenarios, updated by Phase 2 Plan 04,
+# extended by Phase 3 Plan 05 and made backfill-aware by Phase 4 Plan 01).
 #
 # Drives publish\BingWallpaperUpdater.exe against the real endpoints and reads the fixed log tokens
 # (http, catalog source=, enrich hits=, cache hit, cache add, reconcile dropped=, apply ok, tick done, schedule nudge,
 # settings window action=, autostart run value written, monitors attached=, tick reason= ... resolution= auto=,
-# ui language). Prints one "PASS S<n> <name>" line per scenario and finally "SMOKE OK" (exit 0), or
-# "SMOKE FAIL S<n>: <reason>" plus the last 40 log lines (exit 1) on the first failure.
+# ui language, backfill id=, backfill skipped cause=, backfill failed id=, backfill failed error=). Prints one
+# "PASS S<n> <name>" line per scenario and finally "SMOKE OK" (exit 0), or "SMOKE FAIL S<n>: <reason>" plus the last
+# 40 log lines (exit 1) on the first failure.
+#
+# Phase 4 contract (CACHE-06): every successful tick (fetch and newest ensure both succeeded) downloads at most ONE
+# older catalog image after the apply, until 10 images are cached; a failed fetch or a throwing tick downloads
+# nothing beyond the newest attempt; the applied id is never re-downloaded. Assertions about downloads are therefore
+# scoped to the applied id ("cache add id=<applied>" present or absent) and image counts are relative
+# (before + Get-BackfillAdds). A "backfill id=" line is a plain "cache add" of a different id at the tick's own
+# market and resolution; "backfill skipped cause=full|no-candidate" and "backfill failed id=" are the no-download
+# outcomes. "tick done" stays the terminal line of every tick.
 #
 # Phase 2 contract (CONTEXT D-02, D-03, D-06, D-11): every launch runs one Startup tick that issues one conditional
 # GET; the newest image is applied only when its ID differs from the persisted lastSeenNewestId (or the current
@@ -18,22 +27,26 @@
 # read from settings.json at launch and resolved before the first tick / the first control.
 #
 #   S0  reset                 stop the app, wipe %LocalAppData%\BingWallpaperUpdater, assert the exe exists
-#   S1  first run             catalog source=github, enrich hits=, cache add, UHD download, index metadata, no window,
-#                             tick done result=Applied decision=ApplyNew, state.json scheduler fields
+#   S1  first run             catalog source=github, enrich hits=, cache add of the applied id, UHD download, index
+#                             metadata, exactly one backfill id= (or one backfill failed id=), images/jpgs = 1 + adds,
+#                             no window, tick done result=Applied decision=ApplyNew, state.json scheduler fields
 #   S2  single instance       a second launch leaves exactly one process
-#   S3  NoOp restart          raw.githubusercontent.com 304, cache hit, no cache add, no large Bing download,
+#   S3  NoOp restart          raw.githubusercontent.com 304, no cache add of the applied id, the S1 file untouched,
+#                             at most one backfill (large Bing downloads <= adds), images/jpgs = before + adds,
 #                             tick done result=NoOp decision=NoOp, no apply ok, nextDueUtc unchanged
 #   S4  GitHub blocked        BWU_CATALOG_URL -> 404 path; catalog source=hpimagearchive; decision=NoOp and no apply ok
 #                             (or, when HPImageArchive is a day ahead of the README, ApplyNew why=new exactly once);
 #                             then GitHub back -> decision=NoOp, no apply ok (the older README newest is never re-applied)
 #   S5  hand-deleted file     the applied image's file removed -> reconcile dropped=1, apply ok, decision=ApplyNew
-#                             (why=missing-current with a fresh cache add; why=new served from the cache when the
-#                             deleted image was HPImageArchive's day-ahead newest)
+#                             (why=missing-current with a fresh cache add of the applied id; why=new served from the
+#                             cache when the deleted image was HPImageArchive's day-ahead newest); images = before
+#                             (- 1 in the why=new case) + adds
 #   S6  host set              every "http <host>" line across S1-S5 is on the allow-list
 #   S7  data folder           no *.tmp/*.part, settings.json market/interval/mode, state.json scheduler fields,
 #                             state.json currentImageId == applied[0]
 #   S8  past-due catch-up     state.json nextDueUtc 3 h in the past + fake lastSeenNewestId -> one Startup tick,
-#                             result=Applied decision=ApplyNew why=new, apply ok, nextDueUtc re-armed to now + 30 min
+#                             result=Applied decision=ApplyNew why=new, apply ok served from the cache (no cache add
+#                             of the applied id; a backfill add is allowed), nextDueUtc re-armed to now + 30 min
 #   S9  not-due restart       state.json nextDueUtc 20 min ahead + lastSeenNewestId == current -> NoOp, schedule kept
 #   S10 synthetic resume      tools/power-probe.ps1 -NoLaunch against the S9 process -> POWER PROBE OK and
 #                             "schedule nudge source=resume-automatic" in the live log
@@ -48,7 +61,8 @@
 #                             ids=<a,b>" with n == "monitors attached=<n>", min(n, distinct cached) distinct ids,
 #                             index.json applied == ids, every applied file on disk
 #   S15 auto resolution       resolution=Auto + past-due fixture -> tick line "resolution=<concrete> auto=<WxH>" (never
-#                             the literal Auto) and the applied image cached at that concrete resolution
+#                             the literal Auto) and the applied image cached at that concrete resolution; a backfill
+#                             runs at the same resolved resolution, so no full-size download happens either way
 #   S16 language              language=vi -> "ui language setting=vi os=<xx> using=vi" at launch, the Startup tick
 #                             completes, publish\vi\BingWallpaperUpdater.resources.dll exists
 #
@@ -273,6 +287,13 @@ function Get-HttpBytes([string[]]$Lines, [string[]]$Hosts) {
     return $result
 }
 
+# Number of successful backfill downloads in a run (CACHE-06): lines containing " INFO backfill id=". At most one
+# per successful tick; 0 when the cache is full, the catalog has no uncached row or the candidate was rejected.
+function Get-BackfillAdds([string[]]$Lines) {
+    $hits = @($Lines | Where-Object { $_.Contains(' INFO backfill id=') })
+    return $hits.Count
+}
+
 function Save-LogCopy([string]$Scenario) {
     if (Test-Path $logPath) { Copy-Item $logPath (Join-Path $data "log.$Scenario.txt") -Force }
 }
@@ -414,24 +435,48 @@ Assert-TickField $tickLine 'decision' 'ApplyNew'
 $log = @(Read-Log)
 Assert-LogContains $log 'catalog source=github' 'README catalog used' | Out-Null
 Assert-LogContains $log 'enrich hits=' 'HPImageArchive enrichment ran' | Out-Null
-Assert-LogContains $log 'cache add id=OHR.' 'image cached' | Out-Null
+Assert-LogContains $log "cache add id=$appliedId" 'the applied image was downloaded' | Out-Null
 $bing200 = @(Get-HttpBytes $log @('www.bing.com', 'cn.bing.com') | Where-Object { $_.Status -eq 200 -and $_.Bytes -gt 1000000 })
 if ($bing200.Count -lt 1) { Fail "no 'http www.bing.com 200 <bytes>' line above 1000000 bytes (UHD download)" }
 $www = @($log | Where-Object { $_ -match '^\S+ INFO http www\.bing\.com 200 (\d+)\s*$' -and [long]$Matches[1] -gt 1000000 })
 if ($www.Count -lt 1) { Fail "the UHD download was not served by www.bing.com: $($bing200[0].Line)" }
 
+# CACHE-06: the first successful tick backfills exactly one older catalog image after the apply (a rejected candidate
+# logs "backfill failed id=" instead and downloads nothing more); the applied id is the only applied entry either way.
+$adds1 = Get-BackfillAdds $log
+$failed1 = @($log | Where-Object { $_.Contains(' backfill failed id=') })
+if ($adds1 -eq 1) {
+    if ($failed1.Count -ne 0) { Fail "one backfill id= line AND a backfill failed id= line in the first run: $($failed1[0])" }
+    $backfillLine = Assert-LogContains $log ' INFO backfill id=' 'one backfill after the apply'
+    if ($backfillLine -match " INFO backfill id=$([regex]::Escape($appliedId)) ") { Fail "the backfill re-downloaded the applied id: $backfillLine" }
+    if ($backfillLine -notmatch ' cached=2/10\s*$') { Fail "backfill line does not end with cached=2/10: $backfillLine" }
+    $applyAt1 = [array]::IndexOf($log, $applyLine)
+    $backfillAt1 = [array]::IndexOf($log, $backfillLine)
+    $doneAt1 = [array]::IndexOf($log, $tickLine)
+    if (-not ($applyAt1 -lt $backfillAt1 -and $backfillAt1 -lt $doneAt1)) { Fail "expected order apply ok ($applyAt1) < backfill id= ($backfillAt1) < tick done ($doneAt1)" }
+    Write-Host "  backfill: $backfillLine"
+} elseif ($adds1 -eq 0 -and $failed1.Count -eq 1) {
+    Write-Host "  backfill candidate rejected (no second download this run): $($failed1[0])"
+} else {
+    Fail "expected exactly one backfill id= line (or exactly one backfill failed id= line), found adds=$adds1 failed=$($failed1.Count)"
+}
+Assert-LogLacks $log 'backfill skipped' 'a two-image cache is neither full nor without candidates'
+
 $index = Read-Index
-if (@($index.images).Count -ne 1) { Fail "index.json images.Count is $(@($index.images).Count), expected 1" }
-$img = @($index.images)[0]
-if ($img.id -ne $appliedId) { Fail "index image id '$($img.id)' differs from applied id '$appliedId'" }
-if ([string]::IsNullOrWhiteSpace([string]$img.title)) { Fail "index.json images[0].title is empty (enrichment missing)" }
-if ([string]::IsNullOrWhiteSpace([string]$img.copyright)) { Fail "index.json images[0].copyright is empty (enrichment missing)" }
+if (@($index.images).Count -ne (1 + $adds1)) { Fail "index.json images.Count is $(@($index.images).Count), expected $(1 + $adds1) (applied + backfill adds)" }
+$img = @($index.images) | Where-Object { $_.id -eq $appliedId } | Select-Object -First 1
+if (-not $img) { Fail "index.json has no image entry for the applied id '$appliedId'" }
+if ([string]::IsNullOrWhiteSpace([string]$img.title)) { Fail "index.json entry for $appliedId has an empty title (enrichment missing)" }
+if ([string]::IsNullOrWhiteSpace([string]$img.copyright)) { Fail "index.json entry for $appliedId has an empty copyright (enrichment missing)" }
 if (@($index.applied).Count -ne 1 -or @($index.applied)[0] -ne $img.id) { Fail "index.json applied is '$(@($index.applied) -join ',')', expected exactly '$($img.id)'" }
 
 $jpgs = @(Get-CacheJpegs)
-if ($jpgs.Count -ne 1) { Fail "expected exactly 1 *.jpg in cache, found $($jpgs.Count)" }
-if ($jpgs[0].Name -notmatch '^\d{4}-\d{2}-\d{2}_[A-Za-z0-9]+_[A-Z]{2}-[A-Z]{2}[0-9]+\.jpg$') { Fail "cache file name '$($jpgs[0].Name)' does not match yyyy-MM-dd_Name_MARKETdigits.jpg" }
-if ($jpgs[0].Name -ne $img.file) { Fail "cache file '$($jpgs[0].Name)' differs from index file '$($img.file)'" }
+if ($jpgs.Count -ne (1 + $adds1)) { Fail "expected exactly $(1 + $adds1) *.jpg in cache (applied + backfill adds), found $($jpgs.Count)" }
+foreach ($jpg in $jpgs) {
+    if ($jpg.Name -notmatch '^\d{4}-\d{2}-\d{2}_[A-Za-z0-9]+_[A-Z]{2}-[A-Z]{2}[0-9]+\.jpg$') { Fail "cache file name '$($jpg.Name)' does not match yyyy-MM-dd_Name_MARKETdigits.jpg" }
+}
+$appliedJpg = $jpgs | Where-Object { $_.Name -eq $img.file } | Select-Object -First 1
+if (-not $appliedJpg) { Fail "no cache file named like the index entry '$($img.file)' (found: $(($jpgs | ForEach-Object { $_.Name }) -join ', '))" }
 Assert-NoLeftovers
 
 # Phase 2: the Startup tick persists the schedule (ROT-04, ROT-07, D-08).
@@ -468,8 +513,11 @@ Write-Host 'PASS S2 single instance (second launch exits 0, one process)'
 $script:currentScenario = 'S3'
 Remove-LogOnly
 $jpgsBefore = @(Get-CacheJpegs)
-if ($jpgsBefore.Count -ne 1) { Fail "expected exactly 1 *.jpg before the second run, found $($jpgsBefore.Count)" }
-$cacheWriteBefore = $jpgsBefore[0].LastWriteTimeUtc
+if ($jpgsBefore.Count -ne (1 + $adds1)) { Fail "expected exactly $(1 + $adds1) *.jpg before the second run (S1 applied + its backfill adds), found $($jpgsBefore.Count)" }
+$appliedJpgBefore = $jpgsBefore | Where-Object { $_.Name -eq $img.file } | Select-Object -First 1
+if (-not $appliedJpgBefore) { Fail "the S1 applied file '$($img.file)' is missing before the second run" }
+$cacheWriteBefore = $appliedJpgBefore.LastWriteTimeUtc
+$imagesBefore3 = @((Read-Index).images).Count
 $proc = Start-App
 $tickLine = Wait-TickDone 'Startup' $proc
 Assert-TickField $tickLine 'result' 'NoOp'
@@ -478,17 +526,22 @@ $log = @(Read-Log)
 Assert-LogLacks $log 'apply ok' 'a restart with nothing new never re-applies (D-11)'
 Assert-LogContains $log 'http raw.githubusercontent.com 304 ' 'conditional GET answered 304' | Out-Null
 # A NoOp tick never enters ImageCache.EnsureAsync, so the Phase 1 "cache hit id=" line cannot appear here; the cached
-# image is proven reused by identity instead (same single file, untouched) and the "cache hit" token is asserted in S8,
-# where the Phase 2 re-apply is served from the cache.
-Assert-LogLacks $log 'cache add' 'nothing re-downloaded'
-$large = @(Get-HttpBytes $log @('www.bing.com', 'cn.bing.com') | Where-Object { $_.Bytes -gt 100000 })
-if ($large.Count -gt 0) { Fail "a Bing response above 100000 bytes was fetched on the second run: $($large[0].Line)" }
+# image is proven reused by identity instead (the applied file, untouched by name) and the "cache hit" token is
+# asserted in S8, where the Phase 2 re-apply is served from the cache. CACHE-06: the successful NoOp tick may still
+# backfill one OTHER catalog image, so the no-download assertions are scoped to the applied id and the counts are
+# relative to the run's backfill adds.
+Assert-LogLacks $log "cache add id=$appliedId" 'the applied image is never re-downloaded'
+$adds3 = Get-BackfillAdds $log
+if ($adds3 -gt 1) { Fail "more than one backfill in the second run: $adds3" }
+$large = @(Get-HttpBytes $log @('www.bing.com', 'cn.bing.com') | Where-Object { $_.Status -eq 200 -and $_.Bytes -gt 100000 })
+if ($large.Count -gt $adds3) { Fail "$($large.Count) Bing responses above 100000 bytes on the second run but only $adds3 backfill add(s): $($large[0].Line)" }
 $jpgsAfter = @(Get-CacheJpegs)
-if ($jpgsAfter.Count -ne 1) { Fail "expected exactly 1 *.jpg after the second run, found $($jpgsAfter.Count)" }
-if ($jpgsAfter[0].Name -ne $jpgsBefore[0].Name) { Fail "cache file changed across the second run: '$($jpgsBefore[0].Name)' -> '$($jpgsAfter[0].Name)'" }
-if ($jpgsAfter[0].LastWriteTimeUtc -ne $cacheWriteBefore) { Fail "cache file $($jpgsAfter[0].Name) was rewritten on the second run" }
+if ($jpgsAfter.Count -ne ($jpgsBefore.Count + $adds3)) { Fail "expected $($jpgsBefore.Count + $adds3) *.jpg after the second run (before + backfill adds), found $($jpgsAfter.Count)" }
+$appliedJpgAfter = $jpgsAfter | Where-Object { $_.Name -eq $img.file } | Select-Object -First 1
+if (-not $appliedJpgAfter) { Fail "the S1 applied file '$($img.file)' disappeared across the second run" }
+if ($appliedJpgAfter.LastWriteTimeUtc -ne $cacheWriteBefore) { Fail "cache file $($img.file) was rewritten on the second run" }
 $index = Read-Index
-if (@($index.images).Count -ne 1) { Fail "index.json images.Count is $(@($index.images).Count) after the second run, expected 1" }
+if (@($index.images).Count -ne ($imagesBefore3 + $adds3)) { Fail "index.json images.Count is $(@($index.images).Count) after the second run, expected $($imagesBefore3 + $adds3) (before + backfill adds)" }
 if (@($index.applied)[0] -ne $appliedId) { Fail "index applied[0] is '$(@($index.applied)[0])' after the second run, first run applied '$appliedId'" }
 $nextDueAfterS3 = Get-StateRawValue 'nextDueUtc'
 if ($nextDueAfterS3 -ne $nextDueAfterS1) { Fail "state.json nextDueUtc changed across the restart: '$nextDueAfterS1' -> '$nextDueAfterS3'" }
@@ -498,7 +551,8 @@ Stop-App
 Save-LogCopy 'S3'
 Write-Host "  tick: $tickLine"
 Write-Host "  nextDueUtc unchanged: $nextDueAfterS3"
-Write-Host 'PASS S3 NoOp second run (304, cache hit, no download, no re-apply, nextDueUtc kept)'
+Write-Host "  backfill adds: $adds3"
+Write-Host 'PASS S3 NoOp second run (304, applied file reused untouched, no re-download of the applied id, no re-apply, nextDueUtc kept)'
 
 # ---- S4 GitHub blocked -> HPImageArchive ----------------------------------------------------------------
 
@@ -579,24 +633,28 @@ $reconcileLine = Assert-LogContains $log 'reconcile dropped=1' 'missing file dro
 $reconcileAt = [array]::IndexOf($log, $reconcileLine)
 $applyAt = [array]::IndexOf($log, $applyLine)
 $why5 = Get-TickField $tickLine 'why'
-$expectedImages5 = $imagesBefore5
+# CACHE-06: the successful tick may add one backfill after the apply, so the download assertions are scoped to the
+# applied id (the backfill's own "cache add" is a different id) and the expected count carries the backfill adds.
+$adds5 = Get-BackfillAdds $log
+if ($adds5 -gt 1) { Fail "more than one backfill in the reconcile run: $adds5" }
+$expectedImages5 = $imagesBefore5 + $adds5
 if ($why5 -eq 'missing-current') {
     # The catalog newest is the missing image: re-downloaded, then applied.
-    $addLine = Assert-LogContains $log 'cache add id=' 'image re-downloaded'
+    $addLine = Assert-LogContains $log "cache add id=$appliedId5" 'the applied image was re-downloaded'
     $addAt = [array]::IndexOf($log, $addLine)
     if (-not ($reconcileAt -lt $addAt -and $addAt -lt $applyAt)) { Fail "expected order reconcile ($reconcileAt) < cache add ($addAt) < apply ok ($applyAt)" }
 } elseif ($archiveAhead -and $why5 -eq 'new') {
     # The deleted image was HPImageArchive's day-ahead newest and the README still lists yesterday's: with the
     # last-seen entry gone from the cache nothing vouches for the README newest, so it is applied from its cached file.
     Assert-LogContains $log 'cache hit id=' 'README newest served from the cache' | Out-Null
-    Assert-LogLacks $log 'cache add' 'nothing re-downloaded: the README newest was still cached'
+    Assert-LogLacks $log "cache add id=$appliedId5" 'the applied image was not re-downloaded: the README newest was still cached'
     if (-not ($reconcileAt -lt $applyAt)) { Fail "expected order reconcile ($reconcileAt) < apply ok ($applyAt)" }
-    $expectedImages5 = $imagesBefore5 - 1
+    $expectedImages5 = $imagesBefore5 - 1 + $adds5
 } else {
     Fail "tick line has why=$why5, expected missing-current (or new after a day-ahead HPImageArchive apply): $tickLine"
 }
 $index = Read-Index
-if (@($index.images).Count -ne $expectedImages5) { Fail "index.json images.Count is $(@($index.images).Count) after reconcile, expected $expectedImages5" }
+if (@($index.images).Count -ne $expectedImages5) { Fail "index.json images.Count is $(@($index.images).Count) after reconcile, expected $expectedImages5 (before $imagesBefore5, backfill adds $adds5)" }
 $entry5After = @($index.images) | Where-Object { $_.id -eq $appliedId5 } | Select-Object -First 1
 if (-not $entry5After) { Fail "index.json has no image entry for the applied id $appliedId5" }
 $file5 = Join-Path $cacheDir $entry5After.file
@@ -604,6 +662,7 @@ if (-not (Test-Path $file5)) { Fail "index.json points at a missing file: $file5
 Stop-App
 Save-LogCopy 'S5'
 Write-Host "  tick: $tickLine"
+Write-Host "  backfill adds: $adds5"
 Write-Host "PASS S5 hand-deleted file -> reconcile dropped=1, apply ok (ApplyNew why=$why5)"
 
 # ---- S6 host set ----------------------------------------------------------------------------------------
@@ -670,7 +729,10 @@ $applyLine = Assert-LogContains $log 'apply ok' 'past-due schedule with a new ca
 $appliedId8 = Get-AppliedId $applyLine
 Wait-Applied $appliedId8
 Assert-LogContains $log 'cache hit id=' 'the catch-up apply was served from the cache' | Out-Null
-Assert-LogLacks $log 'cache add' 'nothing re-downloaded for the catch-up'
+# CACHE-06: scoped to the applied id - the successful catch-up tick may still backfill one other catalog image.
+Assert-LogLacks $log "cache add id=$appliedId8" 'the applied image was not re-downloaded for the catch-up'
+$adds8 = Get-BackfillAdds $log
+if ($adds8 -gt 1) { Fail "more than one backfill in the catch-up run: $adds8" }
 $applyLines = @($log | Where-Object { $_.Contains(' apply ok ') })
 if ($applyLines.Count -ne 1) { Fail "expected exactly one apply ok in the catch-up run, found $($applyLines.Count)" }
 $tickLines = @($log | Where-Object { $_ -match ' INFO tick reason=' })
@@ -688,7 +750,8 @@ Stop-App
 Save-LogCopy 'S8'
 Write-Host "  tick: $tickLine"
 Write-Host "  nextDueUtc before=$pastDue after=$nextDueRaw8"
-Write-Host 'PASS S8 past-due state -> one catch-up tick, apply ok, nextDueUtc re-armed'
+Write-Host "  backfill adds: $adds8"
+Write-Host 'PASS S8 past-due state -> one catch-up tick, apply ok from the cache, nextDueUtc re-armed'
 
 # ---- S9 not-due restart, unchanged catalog --------------------------------------------------------------
 
@@ -865,6 +928,9 @@ Write-Host "PASS S14 market de-DE ($deShape id) then vi-VN applied (ROW id parse
 $script:currentScenario = 'S13'
 Remove-LogOnly
 Write-Settings @{ monitorMode = 'perMonitor' }
+# CACHE-06 needs no change here: the per-monitor plan candidates are computed before the apply, and the backfill runs
+# after it, so an image backfilled in this very tick never enters "ids=" - every id in the plan was cached before the
+# run and is therefore in $distinctBefore.
 $distinctBefore = @(Get-DistinctCachedIds)
 if ($distinctBefore.Count -lt 2) { Fail "S13 needs at least two distinct cached images with files, found $($distinctBefore.Count)" }
 $pastDue13 = Set-PastDueFixture
@@ -936,23 +1002,33 @@ if (-not $entry15) { Fail "index.json has no ($applied15, $res15) entry - the re
 $file15 = Join-Path $cacheDir $entry15.file
 if (-not (Test-Path $file15)) { Fail "cache file missing for the $res15 entry: $file15" }
 if ($applyLine -notmatch (' path=' + [regex]::Escape($file15) + ' ')) { Fail "the applied path is not the $res15 file $file15`: $applyLine" }
+$adds15 = Get-BackfillAdds $log
+if ($adds15 -gt 1) { Fail "more than one backfill in the Auto run: $adds15" }
 if ($res15 -ne 'UHD') {
     # Only UHD entries existed for this id, so the resolved resolution forces a new download named <stem>.<WxH>.jpg.
     $addLine = Assert-LogContains $log "cache add id=$applied15 file=" "a new file at $res15 for the current id"
     if ($addLine -notmatch ('\.' + [regex]::Escape($res15) + '\.jpg ')) { Fail "cache add is not the $res15 variant: $addLine" }
     if ($entry15.file -notmatch ('\.' + [regex]::Escape($res15) + '\.jpg$')) { Fail "index file '$($entry15.file)' lacks the .$res15.jpg suffix" }
+    # CACHE-06 precision, proven live: the backfill (when one ran) uses the same tick-local resolved resolution, so it is
+    # a CDN-resized download as well - NO response in this run may be full-size, whether it was the newest or the backfill.
     $bing200 = @(Get-HttpBytes $log @('www.bing.com', 'cn.bing.com') | Where-Object { $_.Status -eq 200 -and $_.Bytes -gt 1000000 })
-    if ($bing200.Count -gt 0) { Fail "a full-size (>1000000 bytes) Bing download happened although $res15 was resolved: $($bing200[0].Line)" }
+    if ($bing200.Count -gt 0) { Fail "a full-size (>1000000 bytes) Bing download happened although $res15 was resolved (backfill adds=$adds15): $($bing200[0].Line)" }
+    if ($adds15 -eq 1) {
+        $backfill15 = Assert-LogContains $log ' INFO backfill id=' 'the backfill line'
+        if ($backfill15 -notmatch ('\.' + [regex]::Escape($res15) + '\.jpg ')) { Fail "the backfill is not the $res15 variant: $backfill15" }
+    }
 } else {
     # A monitor above 1920x1200 resolves to UHD, which is already cached for the current id: served from the cache.
+    # CACHE-06: scoped to the applied id - a UHD backfill of another id is allowed.
     Assert-LogContains $log "cache hit id=$applied15 file=" 'UHD entry served from the cache' | Out-Null
-    Assert-LogLacks $log 'cache add' 'nothing re-downloaded at UHD'
+    Assert-LogLacks $log "cache add id=$applied15" 'the applied image was not re-downloaded at UHD'
 }
 Stop-App
 Save-LogCopy 'S15'
 Write-Host "  tick: $tickStart"
 Write-Host "  done: $tickLine"
 Write-Host "  applied id=$applied15 resolution=$res15 file=$($entry15.file) dims=$($entry15.width)x$($entry15.height)"
+Write-Host "  backfill adds: $adds15"
 Write-Host "PASS S15 Auto resolved to $res15 from $auto15"
 Write-Settings @{ resolution = 'UHD' }
 
