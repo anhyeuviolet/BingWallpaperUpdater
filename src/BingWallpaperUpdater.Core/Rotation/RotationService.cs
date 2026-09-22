@@ -279,17 +279,11 @@ public sealed class RotationService : IDisposable
             return;
         }
 
-        // Fire-and-forget from a finally on a thread-pool continuation: nothing may escape (WR-02). RunReapplyAsync never throws.
-        try
-        {
-            _ = mode
-                ? RunReapplyAsync("settings", force: true)
-                : RunReapplyAsync("display", force: false);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("deferred reapply failed", ex);
-        }
+        // Fire-and-forget from a finally on a thread-pool continuation. Async method: any exception (even one thrown
+        // before its first await) is captured in the discarded task; RunReapplyAsync's own catch logs it (IN-15).
+        _ = mode
+            ? RunReapplyAsync("settings", force: true)
+            : RunReapplyAsync("display", force: false);
     }
 
     /// <summary>Any thread: asks the heartbeat to check the schedule after <see cref="ScheduleMath.ResumeDebounce"/> (bursts coalesce, D-10).</summary>
@@ -816,15 +810,9 @@ public sealed class RotationService : IDisposable
 
     private void OnDisplayDebounce()
     {
-        // Timer callback on a thread-pool thread: nothing may escape (WR-02). RunReapplyAsync never throws.
-        try
-        {
-            _ = RunReapplyAsync("display", force: false);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("display debounce failed", ex);
-        }
+        // Timer callback on a thread-pool thread: nothing may escape (WR-02). Async method: any exception (even one
+        // thrown before its first await) is captured in the discarded task; RunReapplyAsync's own catch logs it (IN-15).
+        _ = RunReapplyAsync("display", force: false);
     }
 
     /// <summary>
